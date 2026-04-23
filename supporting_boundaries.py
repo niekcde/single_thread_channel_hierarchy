@@ -85,25 +85,84 @@ def detect_mode_boundaries_autoK(
     turn_jump_rel: float = 0.05,
     max_boundaries: int = 6,
     gap_ratio_stop: float = 1.8,
+    return_diagnostics: bool = False,
 ):
     sigmas = np.asarray(sigmas, float)
     score = build_boundary_score(sigmas, sinuosity, turning, dist, smooth_w=smooth_w)
+    diagnostics = {
+        "score_percentile": float(score_percentile),
+        "prominence_percentile": float(prominence_percentile),
+        "score_threshold": None,
+        "prominence_threshold": None,
+        "effective_jump_thresholds": {},
+        "min_sep": int(min_sep),
+        "gap_ratio_stop": float(gap_ratio_stop),
+        "candidates": [],
+    }
+
+    def finish(boundary_idx):
+        boundary_idx = list(boundary_idx)
+        diagnostics["kept_indices"] = [int(k) for k in boundary_idx]
+        diagnostics["kept_sigmas"] = [float(sigmas[k]) for k in boundary_idx]
+        diagnostics["candidates"] = sorted(
+            diagnostics["candidates"], key=lambda item: item["sigma_idx"]
+        )
+        result = (boundary_idx, sigmas[boundary_idx], score)
+        if return_diagnostics:
+            return result + (diagnostics,)
+        return result
 
     peaks = find_local_maxima(score)
+    peak_records = {}
+    for peak in peaks:
+        k = int(peak + 1)
+        record = {
+            "peak_score_idx": int(peak),
+            "sigma_idx": k,
+            "sigma": float(sigmas[k]),
+            "score": float(score[peak]),
+            "prominence": None,
+            "local_jump_sinuosity": None,
+            "local_jump_distance": None,
+            "local_jump_turning": None,
+            "passes_score_threshold": False,
+            "passes_prominence_threshold": False,
+            "passes_jump_gate": None,
+            "decision": "unprocessed",
+            "reason": None,
+        }
+        peak_records[int(peak)] = record
+        diagnostics["candidates"].append(record)
+
     if len(peaks) == 0:
-        return [], np.array([]), score
+        return finish([])
 
     score_cut = np.percentile(score, score_percentile)
+    diagnostics["score_threshold"] = float(score_cut)
     peaks = peaks[score[peaks] >= score_cut]
+    score_kept = set(int(peak) for peak in peaks)
+    for peak, record in peak_records.items():
+        record["passes_score_threshold"] = peak in score_kept
+        if peak not in score_kept:
+            record["decision"] = "rejected"
+            record["reason"] = "below score percentile"
     if len(peaks) == 0:
-        return [], np.array([]), score
+        return finish([])
 
     prom = np.array([peak_prominence(score, p, left_right=left_right) for p in peaks])
     prom_cut = np.percentile(prom, prominence_percentile)
+    diagnostics["prominence_threshold"] = float(prom_cut)
+    for peak, peak_prom in zip(peaks, prom):
+        record = peak_records[int(peak)]
+        record["prominence"] = float(peak_prom)
+        record["passes_prominence_threshold"] = bool(peak_prom >= prom_cut)
+        if peak_prom < prom_cut:
+            record["decision"] = "rejected"
+            record["reason"] = "below prominence percentile"
     keep = prom >= prom_cut
     peaks, prom = peaks[keep], prom[keep]
     if len(peaks) == 0:
-        return [], np.array([]), score
+        return finish([])
 
     order = np.argsort(prom)[::-1]
     peaks, prom = peaks[order], prom[order]
@@ -119,41 +178,82 @@ def detect_mode_boundaries_autoK(
         sinu_jump_min_eff = sinu_jump_min
         dist_jump_min_eff = dist_jump_min
         turn_jump_min_eff = turn_jump_min
+    diagnostics["effective_jump_thresholds"] = {
+        "sinuosity": float(sinu_jump_min_eff),
+        "distance": float(dist_jump_min_eff),
+        "turning": float(turn_jump_min_eff),
+    }
 
     chosen_k = []
     chosen_prom = []
     for peak, peak_prom in zip(peaks, prom):
+        record = peak_records[int(peak)]
         k = int(peak + 1)
+        sinu_jump = local_jump(sinuosity, k)
+        dist_jump = local_jump(dist, k)
+        turn_jump = local_jump(turning, k)
+        record["local_jump_sinuosity"] = float(sinu_jump)
+        record["local_jump_distance"] = float(dist_jump)
+        record["local_jump_turning"] = float(turn_jump)
 
         if (
-            local_jump(sinuosity, k) < sinu_jump_min_eff
-            and local_jump(dist, k) < dist_jump_min_eff
-            and local_jump(turning, k) < turn_jump_min_eff
+            sinu_jump < sinu_jump_min_eff
+            and dist_jump < dist_jump_min_eff
+            and turn_jump < turn_jump_min_eff
         ):
+            record["passes_jump_gate"] = False
+            record["decision"] = "rejected"
+            record["reason"] = "insufficient local jump"
+            continue
+        record["passes_jump_gate"] = True
+
+        too_close_to = next(
+            (int(chosen) for chosen in chosen_k if abs(k - chosen) < min_sep),
+            None,
+        )
+        if too_close_to is not None:
+            record["decision"] = "rejected"
+            record["reason"] = f"too close to stronger peak at sigma_idx={too_close_to}"
             continue
 
         if all(abs(k - chosen) >= min_sep for chosen in chosen_k):
             chosen_k.append(k)
             chosen_prom.append(float(peak_prom))
+            record["decision"] = "chosen_before_gap_stop"
+            record["reason"] = "passed local filters"
 
         if len(chosen_k) >= max_boundaries:
             break
 
     if len(chosen_k) == 0:
-        return [], np.array([]), score
+        return finish([])
 
     sort_desc = np.argsort(chosen_prom)[::-1]
     chosen_k = [chosen_k[i] for i in sort_desc]
     chosen_prom = [chosen_prom[i] for i in sort_desc]
 
+    chosen_lookup = {int(record["sigma_idx"]): record for record in diagnostics["candidates"]}
     kept = [chosen_k[0]]
+    chosen_lookup[int(chosen_k[0])]["decision"] = "kept"
+    chosen_lookup[int(chosen_k[0])]["reason"] = "selected boundary"
     for i in range(1, len(chosen_k)):
         if chosen_prom[i - 1] / max(chosen_prom[i], 1e-12) >= gap_ratio_stop:
+            chosen_lookup[int(chosen_k[i])]["decision"] = "rejected"
+            chosen_lookup[int(chosen_k[i])]["reason"] = "weaker than gap-ratio stop"
             break
         kept.append(chosen_k[i])
+        chosen_lookup[int(chosen_k[i])]["decision"] = "kept"
+        chosen_lookup[int(chosen_k[i])]["reason"] = "selected boundary"
 
     kept = sorted(kept)
-    return kept, sigmas[kept], score
+    for chosen in chosen_k:
+        if chosen in kept:
+            continue
+        record = chosen_lookup[int(chosen)]
+        if record["decision"] == "chosen_before_gap_stop":
+            record["decision"] = "rejected"
+            record["reason"] = "weaker than gap-ratio stop"
+    return finish(kept)
 
 
 def representative_modes_by_stability(sigmas, reps, boundaries_idx, score):
@@ -222,10 +322,33 @@ def prune_redundant_adjacent_modes(
     dist_w_frac: float = 0.30,
     turn_frac_min: float = 0.15,
     sc_frac_min: float = 0.25,
+    sinu_abs_min: float = 0.0,
+    dist_sample_spacing: float | None = None,
+    dist_min_samples: int = 200,
+    dist_max_samples: int = 4000,
     verbose: bool = False,
+    return_diagnostics: bool = False,
 ):
     """Drop adjacent modes that are too similar to the previous kept mode."""
     if len(modes) <= 1:
+        diagnostics = {
+            "settings": {
+                "dist_abs": float(dist_abs),
+                "dist_w_frac": float(dist_w_frac),
+                "turn_frac_min": float(turn_frac_min),
+                "sc_frac_min": float(sc_frac_min),
+                "sinu_abs_min": float(sinu_abs_min),
+                "dist_sample_spacing": None
+                if dist_sample_spacing is None
+                else float(dist_sample_spacing),
+                "dist_min_samples": int(dist_min_samples),
+                "dist_max_samples": int(dist_max_samples),
+            },
+            "candidates": [],
+            "fallback": {"used": False},
+        }
+        if return_diagnostics:
+            return modes, mode_sigmas, diagnostics
         return modes, mode_sigmas
 
     def dist_thresh(mult):
@@ -235,25 +358,81 @@ def prune_redundant_adjacent_modes(
 
     keep_modes = []
     keep_sig = []
+    diagnostics = {
+        "settings": {
+            "dist_abs": float(dist_abs),
+            "dist_w_frac": float(dist_w_frac),
+            "turn_frac_min": float(turn_frac_min),
+            "sc_frac_min": float(sc_frac_min),
+            "sinu_abs_min": float(sinu_abs_min),
+            "dist_sample_spacing": None
+            if dist_sample_spacing is None
+            else float(dist_sample_spacing),
+            "dist_min_samples": int(dist_min_samples),
+            "dist_max_samples": int(dist_max_samples),
+        },
+        "candidates": [],
+        "fallback": {"used": False},
+    }
     for i, (mode, sigma) in enumerate(zip(modes, mode_sigmas)):
+        record = {
+            "candidate_index": int(i),
+            "sigma": float(sigma),
+            "comparison_basis": None,
+            "distance": None,
+            "distance_threshold": None,
+            "distance_pass": None,
+            "turn_drop_frac": None,
+            "sign_change_drop_frac": None,
+            "sinuosity_drop_abs": None,
+            "kept": False,
+            "reason": None,
+        }
         if len(keep_modes) == 0:
             if original is None:
                 keep_modes.append(mode)
                 keep_sig.append(float(sigma))
+                record["comparison_basis"] = "none"
+                record["kept"] = True
+                record["reason"] = "kept without comparison baseline"
+                diagnostics["candidates"].append(record)
                 continue
 
             prev = original
-            distance = mean_distance_to_original(prev, mode, n=600)
+            distance, sampling = mean_distance_to_original(
+                prev,
+                mode,
+                sample_spacing=dist_sample_spacing,
+                min_samples=dist_min_samples,
+                max_samples=dist_max_samples,
+                return_diagnostics=True,
+            )
             distance_thresh = dist_thresh(first_dist_w_mult)
+            record["comparison_basis"] = "original"
         else:
             prev = keep_modes[-1]
-            distance = mean_distance_to_original(prev, mode, n=400)
+            distance, sampling = mean_distance_to_original(
+                prev,
+                mode,
+                sample_spacing=dist_sample_spacing,
+                min_samples=dist_min_samples,
+                max_samples=dist_max_samples,
+                return_diagnostics=True,
+            )
             distance_thresh = dist_thresh(adj_dist_w_mult)
+            record["comparison_basis"] = "previous_kept_mode"
+
+        record["distance"] = float(distance)
+        record["distance_threshold"] = float(distance_thresh)
+        record["distance_pass"] = bool(distance >= distance_thresh)
+        record["distance_sampling"] = sampling
 
         if verbose:
             print(f"i={i} distance={distance:.2f} threshold={distance_thresh:.2f}")
 
         if distance < distance_thresh:
+            record["reason"] = "failed distance gate"
+            diagnostics["candidates"].append(record)
             continue
 
         prev_turning = turning_energy(prev)
@@ -263,20 +442,42 @@ def prune_redundant_adjacent_modes(
         prev_sign_changes = curvature_sign_changes(prev)
         mode_sign_changes = curvature_sign_changes(mode)
         sc_drop = (prev_sign_changes - mode_sign_changes) / max(prev_sign_changes, 1)
+        prev_sinuosity = global_sinuosity(prev)
+        mode_sinuosity = global_sinuosity(mode)
+        sinu_drop = prev_sinuosity - mode_sinuosity
+        record["turn_drop_frac"] = float(turn_drop)
+        record["sign_change_drop_frac"] = float(sc_drop)
+        record["sinuosity_drop_abs"] = float(sinu_drop)
 
         if verbose:
             print(f"i={i} turn_drop={turn_drop:.3f} sc_drop={sc_drop:.3f}")
 
-        if (turn_drop >= turn_frac_min) or (sc_drop >= sc_frac_min):
+        if (
+            (turn_drop >= turn_frac_min)
+            or (sc_drop >= sc_frac_min)
+            or (sinu_drop >= sinu_abs_min)
+        ):
             if verbose:
                 print(f"keeping mode i={i}")
             keep_modes.append(mode)
             keep_sig.append(float(sigma))
+            record["kept"] = True
+            record["reason"] = "passed complexity gate"
+        else:
+            record["reason"] = "failed complexity gate"
+        diagnostics["candidates"].append(record)
 
     if len(keep_modes) == 0:
         keep_modes = [modes[-1]]
         keep_sig = [float(mode_sigmas[-1])]
+        diagnostics["fallback"] = {
+            "used": True,
+            "sigma": float(mode_sigmas[-1]),
+            "reason": "no candidate survived pruning",
+        }
 
+    if return_diagnostics:
+        return keep_modes, np.asarray(keep_sig, float), diagnostics
     return keep_modes, np.asarray(keep_sig, float)
 
 
@@ -309,6 +510,10 @@ def try_insert_mid_boundary(
     adj_dist_w_mult: float = 0.7,
     turn_frac_min: float = 0.15,
     sc_frac_min: float = 0.25,
+    sinu_abs_min: float = 0.0,
+    dist_sample_spacing: float | None = None,
+    dist_min_samples: int = 200,
+    dist_max_samples: int = 4000,
 ) -> Tuple[List[int], Dict[str, Any]]:
     """Attempt to add one mid boundary if it survives pruning."""
     idx = sorted(set(int(k) for k in idx))
@@ -355,13 +560,21 @@ def try_insert_mid_boundary(
     k_mid = j_mid + 1
 
     if any(abs(k_mid - k) < min_sep for k in idx):
-        return idx, {"mid_added": False, "reason": "mid too close (index)"}
+        return idx, {
+            "mid_added": False,
+            "reason": "mid too close (index)",
+            "candidate_sigma": float(sigmas[int(k_mid)]),
+        }
 
     sigma_mid = float(sigmas[k_mid])
     for k in idx:
         sigma_k = float(sigmas[k])
         if abs(np.log(sigma_mid / sigma_k)) < log_sigma_tol:
-            return idx, {"mid_added": False, "reason": "mid too close (log-sigma)"}
+            return idx, {
+                "mid_added": False,
+                "reason": "mid too close (log-sigma)",
+                "candidate_sigma": float(sigmas[int(k_mid)]),
+            }
 
     def build_modes_from_idx(idx_list: List[int]) -> Tuple[np.ndarray, List[LineString]]:
         mode_sigmas, mode_lines = representative_modes_by_stability(
@@ -392,6 +605,10 @@ def try_insert_mid_boundary(
             adj_dist_w_mult=float(adj_dist_w_mult),
             turn_frac_min=float(turn_frac_min),
             sc_frac_min=float(sc_frac_min),
+            sinu_abs_min=float(sinu_abs_min),
+            dist_sample_spacing=dist_sample_spacing,
+            dist_min_samples=int(dist_min_samples),
+            dist_max_samples=int(dist_max_samples),
         )
         return mode_sigmas, modes
 
@@ -405,9 +622,18 @@ def try_insert_mid_boundary(
             "k_mid": int(k_mid),
             "sigma_mid": float(sigmas[int(k_mid)]),
             "interval": (int(a), int(b)),
+            "base_mode_count": int(len(base_modes)),
+            "try_mode_count": int(len(try_modes)),
         }
 
-    return idx, {"mid_added": False, "reason": "redundant after pruning"}
+    return idx, {
+        "mid_added": False,
+        "reason": "redundant after pruning",
+        "candidate_sigma": float(sigmas[int(k_mid)]),
+        "interval": (int(a), int(b)),
+        "base_mode_count": int(len(base_modes)),
+        "try_mode_count": int(len(try_modes)),
+    }
 
 
 def maybe_add_terminal_mode(
@@ -422,69 +648,96 @@ def maybe_add_terminal_mode(
     min_sinu_drop: float = 0.03,
     min_dist_increase: float = 0.10,
     ls_eq=None,
+    dist_sample_spacing: float | None = None,
+    dist_min_samples: int = 200,
+    dist_max_samples: int = 4000,
 ):
+    info = {
+        "added_terminal": False,
+        "reason": None,
+        "tail_frac": float(tail_frac),
+        "min_prom_frac": float(min_prom_frac),
+        "min_sinu_drop": float(min_sinu_drop),
+        "min_dist_increase": float(min_dist_increase),
+    }
     if len(sigmas) < 10 or len(score) < 10 or ls_eq is None or len(modes) == 0:
-        return mode_sigmas, modes, {
-            "added_terminal": False,
-            "reason": "insufficient data",
-        }
+        info["reason"] = "insufficient data"
+        return mode_sigmas, modes, info
 
     sigmas = np.asarray(sigmas, float)
     score = np.asarray(score, float)
 
     j0 = max(int((1 - tail_frac) * len(score)), 0)
     tail = score[j0:]
+    info["tail_start_score_idx"] = int(j0)
+    info["tail_start_sigma"] = float(sigmas[min(j0 + 1, len(sigmas) - 1)])
     if len(tail) < 5:
-        return mode_sigmas, modes, {"added_terminal": False, "reason": "tail too short"}
+        info["reason"] = "tail too short"
+        return mode_sigmas, modes, info
 
     j_peak = j0 + int(np.argmax(tail))
+    info["tail_peak_score_idx"] = int(j_peak)
 
     prom = peak_prominence(score, j_peak, left_right=12)
     prom_global = float(
         np.max([peak_prominence(score, j, left_right=12) for j in range(1, len(score) - 1)])
     )
+    info["prominence"] = float(prom)
+    info["prominence_global_max"] = float(prom_global)
+    info["prominence_ratio"] = float(prom / max(prom_global, 1e-12))
     if prom_global <= 0:
-        return mode_sigmas, modes, {
-            "added_terminal": False,
-            "reason": "no global prominence",
-        }
+        info["reason"] = "no global prominence"
+        return mode_sigmas, modes, info
 
     if prom < min_prom_frac * prom_global:
-        return mode_sigmas, modes, {
-            "added_terminal": False,
-            "reason": f"tail peak not prominent enough ({prom:.4g})",
-        }
+        info["reason"] = f"tail peak not prominent enough ({prom:.4g})"
+        return mode_sigmas, modes, info
 
     k = j_peak + 1
     sigma_terminal = float(sigmas[k])
     candidate = reps[k]
+    info["sigma"] = float(sigma_terminal)
 
     last_mode = modes[-1]
     sinu_last = global_sinuosity(last_mode)
     sinu_candidate = global_sinuosity(candidate)
+    info["sinuosity_last"] = float(sinu_last)
+    info["sinuosity_candidate"] = float(sinu_candidate)
+    info["sinuosity_drop"] = float(sinu_last - sinu_candidate)
 
-    dist_last = mean_distance_to_original(ls_eq, last_mode, n=600)
-    dist_candidate = mean_distance_to_original(ls_eq, candidate, n=600)
+    dist_last, sampling = mean_distance_to_original(
+        ls_eq,
+        last_mode,
+        sample_spacing=dist_sample_spacing,
+        min_samples=dist_min_samples,
+        max_samples=dist_max_samples,
+        return_diagnostics=True,
+    )
+    dist_candidate = mean_distance_to_original(
+        ls_eq,
+        candidate,
+        sample_spacing=dist_sample_spacing,
+        min_samples=dist_min_samples,
+        max_samples=dist_max_samples,
+    )
+    info["distance_last"] = float(dist_last)
+    info["distance_candidate"] = float(dist_candidate)
+    info["distance_ratio"] = float(dist_candidate / max(dist_last, 1e-9))
+    info["distance_sampling"] = sampling
 
     if (sinu_last - sinu_candidate) < min_sinu_drop:
-        return mode_sigmas, modes, {
-            "added_terminal": False,
-            "reason": "no extra sinuosity drop",
-        }
+        info["reason"] = "no extra sinuosity drop"
+        return mode_sigmas, modes, info
 
     if dist_candidate < (1 + min_dist_increase) * max(dist_last, 1e-9):
-        return mode_sigmas, modes, {
-            "added_terminal": False,
-            "reason": "no extra deviation increase",
-        }
+        info["reason"] = "no extra deviation increase"
+        return mode_sigmas, modes, info
 
     mode_sigmas2 = np.append(mode_sigmas, sigma_terminal)
     modes2 = list(modes) + [candidate]
-    return mode_sigmas2, modes2, {
-        "added_terminal": True,
-        "sigma": sigma_terminal,
-        "prominence": float(prom),
-    }
+    info["added_terminal"] = True
+    info["reason"] = "accepted"
+    return mode_sigmas2, modes2, info
 
 
 def _demo() -> None:

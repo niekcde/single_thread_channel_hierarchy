@@ -38,18 +38,75 @@ def turning_energy(ls: LineString) -> float:
     return float(np.sum(angles) / ls.length)
 
 
+def resolve_distance_sampling(
+    original: LineString,
+    *,
+    n: int | None = None,
+    sample_spacing: float | None = None,
+    min_samples: int = 200,
+    max_samples: int = 4000,
+):
+    length = float(original.length)
+    if length <= 0:
+        return {
+            "sample_count": 1,
+            "requested_count": None if n is None else int(n),
+            "requested_spacing": None if sample_spacing is None else float(sample_spacing),
+            "actual_spacing": 0.0,
+            "strategy": "degenerate",
+            "min_samples": int(min_samples),
+            "max_samples": int(max_samples),
+        }
+
+    if n is not None:
+        sample_count = max(int(n), 2)
+        strategy = "fixed_count"
+    else:
+        if sample_spacing is None:
+            sample_spacing = 250.0
+        sample_count = int(np.ceil(length / float(sample_spacing))) + 1
+        sample_count = int(np.clip(sample_count, min_samples, max_samples))
+        sample_count = max(sample_count, 2)
+        strategy = "spacing_capped"
+
+    return {
+        "sample_count": int(sample_count),
+        "requested_count": None if n is None else int(n),
+        "requested_spacing": None if sample_spacing is None else float(sample_spacing),
+        "actual_spacing": float(length / max(sample_count - 1, 1)),
+        "strategy": strategy,
+        "min_samples": int(min_samples),
+        "max_samples": int(max_samples),
+    }
+
+
 def mean_distance_to_original(
     original: LineString,
     other: LineString,
-    n: int = 600,
+    n: int | None = None,
+    *,
+    sample_spacing: float | None = None,
+    min_samples: int = 200,
+    max_samples: int = 4000,
+    return_diagnostics: bool = False,
 ) -> float:
+    sampling = resolve_distance_sampling(
+        original,
+        n=n,
+        sample_spacing=sample_spacing,
+        min_samples=min_samples,
+        max_samples=max_samples,
+    )
     length = float(original.length)
     if length <= 0:
-        return 0.0
+        return (0.0, sampling) if return_diagnostics else 0.0
 
-    dists = np.linspace(0, length, n)
+    dists = np.linspace(0, length, sampling["sample_count"])
     pts = [original.interpolate(d) for d in dists]
-    return float(np.mean([other.distance(point) for point in pts]))
+    distance = float(np.mean([other.distance(point) for point in pts]))
+    if return_diagnostics:
+        return distance, sampling
+    return distance
 
 
 def curvature_sign_changes(ls: LineString) -> int:

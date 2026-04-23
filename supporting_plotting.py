@@ -6,14 +6,51 @@ from typing import Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 from shapely.geometry import LineString
 
 
-def plot_thresholding(sigmas, sinu, turn, dist, boundary_sigmas, score, terminal_info):
+def plot_thresholding(
+    sigmas,
+    sinu,
+    turn,
+    dist,
+    peak_boundary_sigmas,
+    added_boundary_sigmas,
+    discarded_mode_candidate_sigmas,
+    mode_sigmas,
+    score,
+):
     fig, ax = plt.subplots(1, 4, figsize=(20, 4))
+    peak_boundary_sigmas = np.asarray(peak_boundary_sigmas, float)
+    added_boundary_sigmas = np.asarray(added_boundary_sigmas, float)
+    discarded_mode_candidate_sigmas = np.asarray(discarded_mode_candidate_sigmas, float)
+    mode_sigmas = np.asarray(mode_sigmas, float)
 
-    if terminal_info.get("added_terminal") is True:
-        ax[3].axvline(sigmas[-1], linestyle="--", linewidth=1)
+    peak_boundary_style = dict(
+        linestyle="--",
+        linewidth=1.1,
+        color="tab:blue",
+        alpha=0.9,
+    )
+    added_boundary_style = dict(
+        linestyle="-.",
+        linewidth=1.2,
+        color="tab:green",
+        alpha=0.95,
+    )
+    discarded_mode_style = dict(
+        linestyle="-",
+        linewidth=0.9,
+        color="0.55",
+        alpha=0.65,
+    )
+    mode_style = dict(
+        linestyle=":",
+        linewidth=1.4,
+        color="tab:orange",
+        alpha=0.95,
+    )
 
     ax[0].plot(sigmas, sinu, linewidth=2)
     ax[0].set_xscale("log")
@@ -33,19 +70,34 @@ def plot_thresholding(sigmas, sinu, turn, dist, boundary_sigmas, score, terminal
     ax[2].set_xlabel("sigma (m)")
     ax[2].set_ylabel("mean distance (m)")
 
-    for axis in ax[:3]:
-        for sigma in boundary_sigmas:
-            axis.axvline(sigma, linestyle="--", linewidth=1)
+    for axis in ax:
+        for sigma in peak_boundary_sigmas:
+            axis.axvline(sigma, **peak_boundary_style)
+        for sigma in added_boundary_sigmas:
+            axis.axvline(sigma, **added_boundary_style)
+        for sigma in discarded_mode_candidate_sigmas:
+            axis.axvline(sigma, **discarded_mode_style)
+        for sigma in mode_sigmas:
+            axis.axvline(sigma, **mode_style)
 
     ax[3].plot(sigmas[1:-1], score, linewidth=2)
     ax[3].set_xscale("log")
     ax[3].set_title("Boundary score")
     ax[3].set_xlabel("sigma (m)")
     ax[3].set_ylabel("score")
-    for sigma in boundary_sigmas:
-        ax[3].axvline(sigma, linestyle="--", linewidth=1)
 
-    plt.tight_layout()
+    fig.legend(
+        handles=[
+            Line2D([0], [0], label="score-peak boundary sigma", **peak_boundary_style),
+            Line2D([0], [0], label="added boundary sigma", **added_boundary_style),
+            Line2D([0], [0], label="discarded mode candidate sigma", **discarded_mode_style),
+            Line2D([0], [0], label="final mode sigma", **mode_style),
+        ],
+        loc="upper center",
+        ncol=4,
+        frameon=False,
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.93))
     plt.show()
 
 

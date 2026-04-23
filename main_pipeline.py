@@ -34,6 +34,7 @@ from supporting_metrics import (
     classify_modes_by_extrema,
     global_sinuosity,
     mean_distance_to_original,
+    resolve_distance_sampling,
     turning_energy,
 )
 
@@ -70,6 +71,10 @@ def build_scale_space_smooth_only(
     ls_eq: LineString,
     sigmas_m,
     step_m: float,
+    *,
+    dist_sample_spacing: float | None = None,
+    dist_min_samples: int = 200,
+    dist_max_samples: int = 4000,
 ):
     reps = []
     sinuosity = []
@@ -81,7 +86,15 @@ def build_scale_space_smooth_only(
         reps.append(smoothed)
         sinuosity.append(global_sinuosity(smoothed))
         turning.append(turning_energy(smoothed))
-        dist.append(mean_distance_to_original(ls_eq, smoothed, n=600))
+        dist.append(
+            mean_distance_to_original(
+                ls_eq,
+                smoothed,
+                sample_spacing=dist_sample_spacing,
+                min_samples=dist_min_samples,
+                max_samples=dist_max_samples,
+            )
+        )
 
     metrics = {
         "sinuosity": np.asarray(sinuosity, float),
@@ -109,6 +122,9 @@ def extract_line_modes_auto(
     sinu_jump_rel: float = 0.02,
     dist_jump_rel: float = 0.03,
     turn_jump_rel: float = 0.05,
+    dist_sample_spacing: float | None = None,
+    dist_sample_min_samples: int = 200,
+    dist_sample_max_samples: int = 4000,
     max_boundaries: int = 6,
     gap_ratio_stop: float = 1.8,
     eps_floor=None,
@@ -131,11 +147,26 @@ def extract_line_modes_auto(
         step_m = choose_step_m(ls, width_m=width_m)
     if eps_floor is None:
         eps_floor = float(step_m)
+    if dist_sample_spacing is None:
+        dist_sample_spacing = float(max(20.0 * step_m, 50.0))
 
     ls_eq = resample_linestring_equal(ls, step_m)
+    distance_sampling = resolve_distance_sampling(
+        ls_eq,
+        sample_spacing=dist_sample_spacing,
+        min_samples=dist_sample_min_samples,
+        max_samples=dist_sample_max_samples,
+    )
     sigmas = choose_sigmas(ls_eq, step_m=step_m, width_m=width_m, n_sigmas=n_sigmas)
 
-    reps, metrics = build_scale_space_smooth_only(ls_eq, sigmas, step_m)
+    reps, metrics = build_scale_space_smooth_only(
+        ls_eq,
+        sigmas,
+        step_m,
+        dist_sample_spacing=dist_sample_spacing,
+        dist_min_samples=dist_sample_min_samples,
+        dist_max_samples=dist_sample_max_samples,
+    )
     sinuosity = metrics["sinuosity"]
     turning = metrics["turning"]
     dist = metrics["dist"]
@@ -146,7 +177,7 @@ def extract_line_modes_auto(
         else:
             dist_jump_min = float(ls_eq.length) / 200.0
 
-    idx, _, score = detect_mode_boundaries_autoK(
+    idx, _, score, boundary_diagnostics = detect_mode_boundaries_autoK(
         sigmas,
         sinuosity,
         turning,
@@ -165,6 +196,7 @@ def extract_line_modes_auto(
         turn_jump_rel=turn_jump_rel,
         max_boundaries=max_boundaries,
         gap_ratio_stop=gap_ratio_stop,
+        return_diagnostics=True,
     )
 
     axis_fallback_used = False
@@ -174,13 +206,15 @@ def extract_line_modes_auto(
         axis_idx = int(np.argmin(np.abs(np.log(sigmas) - np.log(axis_sigma))))
         idx = [axis_idx]
 
-    def build_and_prune(idx_list: List[int]) -> Tuple[np.ndarray, List[LineString]]:
-        mode_sigmas, mode_lines_smooth = representative_modes_by_stability(
+    def build_and_prune(
+        idx_list: List[int],
+    ) -> Tuple[np.ndarray, List[LineString], Dict[str, Any], np.ndarray]:
+        mode_candidate_sigmas, mode_lines_smooth = representative_modes_by_stability(
             sigmas, reps, idx_list, score
         )
 
         modes = []
-        for sigma, mode in zip(mode_sigmas, mode_lines_smooth):
+        for sigma, mode in zip(mode_candidate_sigmas, mode_lines_smooth):
             out = simplify_mode(
                 mode,
                 sigma=float(sigma),
@@ -192,9 +226,9 @@ def extract_line_modes_auto(
                 out = snap_vertices_to_original(out, ls_eq)
             modes.append(out)
 
-        modes, mode_sigmas = prune_redundant_adjacent_modes(
+        modes, mode_sigmas, prune_diagnostics = prune_redundant_adjacent_modes(
             modes,
-            mode_sigmas,
+            mode_candidate_sigmas,
             original=ls_eq,
             width_m=width_m,
             dist_abs=prune_dist_abs,
@@ -202,13 +236,18 @@ def extract_line_modes_auto(
             adj_dist_w_mult=3.0,
             dist_w_frac=prune_dist_w_frac,
             turn_frac_min=0.15,
-            sc_frac_min=0.25,
+            sc_frac_min=prune_sc_drop_frac,
+            sinu_abs_min=prune_sinu_abs,
+            dist_sample_spacing=dist_sample_spacing,
+            dist_min_samples=dist_sample_min_samples,
+            dist_max_samples=dist_sample_max_samples,
+            return_diagnostics=True,
         )
 
-        return mode_sigmas, modes
+        return mode_sigmas, modes, prune_diagnostics, mode_candidate_sigmas
 
     idx = sorted(set(idx))
-    mode_sigmas, modes = build_and_prune(idx)
+    mode_sigmas, modes, prune_diagnostics, mode_candidate_sigmas = build_and_prune(idx)
 
     mid_info = {"mid_added": False, "reason": "disabled"}
     if allow_mid_insertion:
@@ -224,10 +263,18 @@ def extract_line_modes_auto(
             eps_factor=eps_factor,
             eps_power=eps_power,
             snap_to_original=snap_to_original,
+            dist_abs=prune_dist_abs,
+            dist_w_frac=prune_dist_w_frac,
+            turn_frac_min=0.15,
+            sc_frac_min=prune_sc_drop_frac,
+            sinu_abs_min=prune_sinu_abs,
+            dist_sample_spacing=dist_sample_spacing,
+            dist_min_samples=dist_sample_min_samples,
+            dist_max_samples=dist_sample_max_samples,
         )
         if idx2 != idx:
             idx = idx2
-            mode_sigmas, modes = build_and_prune(idx)
+            mode_sigmas, modes, prune_diagnostics, mode_candidate_sigmas = build_and_prune(idx)
 
     terminal_info = {"added_terminal": False, "reason": "disabled"}
     if allow_terminal:
@@ -242,6 +289,9 @@ def extract_line_modes_auto(
             min_sinu_drop=terminal_min_sinu_drop,
             min_dist_increase=terminal_min_dist_increase,
             ls_eq=ls_eq,
+            dist_sample_spacing=dist_sample_spacing,
+            dist_min_samples=dist_sample_min_samples,
+            dist_max_samples=dist_sample_max_samples,
         )
 
     if len(modes):
@@ -252,6 +302,43 @@ def extract_line_modes_auto(
     boundary_sigmas_final = (
         sigmas[np.asarray(sorted(set(idx)), dtype=int)] if len(idx) else np.array([])
     )
+    peak_boundary_indices = sorted(set(boundary_diagnostics.get("kept_indices", [])))
+    peak_boundary_sigmas = (
+        sigmas[np.asarray(peak_boundary_indices, dtype=int)]
+        if len(peak_boundary_indices)
+        else np.array([])
+    )
+    added_boundary_indices = [k for k in sorted(set(idx)) if k not in peak_boundary_indices]
+    added_boundary_sigmas = (
+        sigmas[np.asarray(added_boundary_indices, dtype=int)]
+        if len(added_boundary_indices)
+        else np.array([])
+    )
+    mode_candidate_sigmas = np.asarray(mode_candidate_sigmas, float)
+    kept_candidate_sigmas = np.array(
+        [sigma for sigma in mode_candidate_sigmas if np.any(np.isclose(mode_sigmas, sigma))],
+        dtype=float,
+    )
+    discarded_mode_candidate_sigmas = np.array(
+        [
+            sigma
+            for sigma in mode_candidate_sigmas
+            if not np.any(np.isclose(kept_candidate_sigmas, sigma))
+        ],
+        dtype=float,
+    )
+    boundary_diagnostics["final_boundary_indices"] = [int(k) for k in sorted(set(idx))]
+    boundary_diagnostics["final_boundary_sigmas"] = [
+        float(s) for s in boundary_sigmas_final
+    ]
+    boundary_diagnostics["peak_boundary_indices"] = [int(k) for k in peak_boundary_indices]
+    boundary_diagnostics["peak_boundary_sigmas"] = [
+        float(s) for s in peak_boundary_sigmas
+    ]
+    boundary_diagnostics["added_boundary_indices"] = [int(k) for k in added_boundary_indices]
+    boundary_diagnostics["added_boundary_sigmas"] = [
+        float(s) for s in added_boundary_sigmas
+    ]
 
     if make_plots:
         from supporting_plotting import plot_modes, plot_thresholding
@@ -261,9 +348,11 @@ def extract_line_modes_auto(
             sinuosity,
             turning,
             dist,
-            boundary_sigmas_final,
+            peak_boundary_sigmas,
+            added_boundary_sigmas,
+            discarded_mode_candidate_sigmas,
+            mode_sigmas,
             score,
-            terminal_info,
         )
 
         plot_labels = []
@@ -279,14 +368,24 @@ def extract_line_modes_auto(
         "ls_equal": ls_eq,
         "step_m": float(step_m),
         "width_m": None if width_m is None else float(width_m),
+        "distance_sampling": distance_sampling,
         "sigmas": sigmas,
         "metrics": metrics,
         "score": score,
         "boundary_indices": sorted(set(idx)),
         "boundary_sigmas": boundary_sigmas_final,
+        "peak_boundary_indices": peak_boundary_indices,
+        "peak_boundary_sigmas": peak_boundary_sigmas,
+        "added_boundary_indices": added_boundary_indices,
+        "added_boundary_sigmas": added_boundary_sigmas,
+        "mode_candidate_sigmas": mode_candidate_sigmas,
+        "kept_candidate_sigmas": kept_candidate_sigmas,
+        "discarded_mode_candidate_sigmas": discarded_mode_candidate_sigmas,
+        "boundary_diagnostics": boundary_diagnostics,
         "axis_fallback_used": axis_fallback_used,
         "mid_info": mid_info,
         "terminal_info": terminal_info,
+        "prune_diagnostics": prune_diagnostics,
         "mode_sigmas": mode_sigmas,
         "modes": modes,
         "curvature_sign_changes": sign_changes,
