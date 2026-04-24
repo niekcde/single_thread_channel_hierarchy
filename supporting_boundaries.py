@@ -48,12 +48,70 @@ def find_local_maxima(y):
     return np.where((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:]))[0] + 1
 
 
+def find_local_minima(y):
+    y = np.asarray(y, float)
+    if len(y) < 3:
+        return np.array([], dtype=int)
+
+    return np.where((y[1:-1] < y[:-2]) & (y[1:-1] <= y[2:]))[0] + 1
+
+
 def peak_prominence(score, idx: int, left_right: int = 12) -> float:
     score = np.asarray(score, float)
     lo = max(0, idx - left_right)
     hi = min(len(score), idx + left_right + 1)
     valley = np.min(score[lo:hi])
     return float(score[idx] - valley)
+
+
+def valley_bounded_peak_stats(score, peak_idx: int, valleys):
+    score = np.asarray(score, float)
+    valleys = np.asarray(valleys, dtype=int)
+
+    pos = int(np.searchsorted(valleys, peak_idx))
+    left_valley = int(valleys[pos - 1]) if pos > 0 else None
+    right_valley = int(valleys[pos]) if pos < len(valleys) else None
+
+    if left_valley is None and right_valley is None:
+        base = np.nan
+        prominence = np.nan
+        contrast = np.nan
+        prom_frac = np.nan
+        log_ratio = np.nan
+    else:
+        if left_valley is None:
+            base = float(score[right_valley])
+        elif right_valley is None:
+            base = float(score[left_valley])
+        else:
+            base = float(max(score[left_valley], score[right_valley]))
+
+        peak = float(score[peak_idx])
+        prominence = float(peak - base)
+        contrast = float(prominence / (peak + base + 1e-12))
+        prom_frac = float(prominence / (peak + 1e-12))
+        log_ratio = float(np.log((peak + 1e-12) / (base + 1e-12)))
+
+    return {
+        "left_valley_score_idx": left_valley,
+        "right_valley_score_idx": right_valley,
+        "base_score": None if not np.isfinite(base) else float(base),
+        "valley_prominence": None if not np.isfinite(prominence) else float(prominence),
+        "contrast": None if not np.isfinite(contrast) else float(contrast),
+        "prom_frac": None if not np.isfinite(prom_frac) else float(prom_frac),
+        "log_ratio": None if not np.isfinite(log_ratio) else float(log_ratio),
+    }
+
+
+def robust_prominence_floor(prominences, mad_mult: float = 1.5) -> float:
+    prominences = np.asarray(prominences, float)
+    prominences = prominences[np.isfinite(prominences) & (prominences > 0)]
+    if len(prominences) == 0:
+        return 0.0
+
+    median = float(np.median(prominences))
+    mad = float(np.median(np.abs(prominences - median)))
+    return float(median + mad_mult * mad)
 
 
 def build_boundary_score(sigmas, sinuosity, turning, dist, smooth_w: int = 7):
@@ -65,16 +123,22 @@ def build_boundary_score(sigmas, sinuosity, turning, dist, smooth_w: int = 7):
     )
 
 
-def detect_mode_boundaries_autoK(
+def detect_boundary_thresholds_autoK(
     sigmas,
     sinuosity,
     turning,
     dist,
     *,
+    selection_mode: str = "adaptive",
+    use_score_percentile_gate: bool = False,
     min_sep: int = 10,
     smooth_w: int = 7,
     score_percentile: float = 80,
     prominence_percentile: float = 70,
+    prominence_mad_mult: float = 1.5,
+    contrast_low: float = 0.15,
+    contrast_high: float = 0.30,
+    borderline_prominence_mult: float = 1.25,
     left_right: int = 12,
     use_relative_jumps: bool = True,
     sinu_jump_min: float = 0.05,
@@ -90,10 +154,18 @@ def detect_mode_boundaries_autoK(
     sigmas = np.asarray(sigmas, float)
     score = build_boundary_score(sigmas, sinuosity, turning, dist, smooth_w=smooth_w)
     diagnostics = {
+        "selection_mode": str(selection_mode),
+        "use_score_percentile_gate": bool(use_score_percentile_gate),
         "score_percentile": float(score_percentile),
         "prominence_percentile": float(prominence_percentile),
         "score_threshold": None,
         "prominence_threshold": None,
+        "prominence_floor": None,
+        "prominence_mad_mult": float(prominence_mad_mult),
+        "contrast_low": float(contrast_low),
+        "contrast_high": float(contrast_high),
+        "borderline_prominence_mult": float(borderline_prominence_mult),
+        "borderline_prominence_floor": None,
         "effective_jump_thresholds": {},
         "min_sep": int(min_sep),
         "gap_ratio_stop": float(gap_ratio_stop),
@@ -113,21 +185,32 @@ def detect_mode_boundaries_autoK(
         return result
 
     peaks = find_local_maxima(score)
+    valleys = find_local_minima(score)
     peak_records = {}
     for peak in peaks:
         k = int(peak + 1)
+        peak_stats = valley_bounded_peak_stats(score, int(peak), valleys)
         record = {
             "peak_score_idx": int(peak),
             "sigma_idx": k,
             "sigma": float(sigmas[k]),
             "score": float(score[peak]),
             "prominence": None,
+            "valley_prominence": peak_stats["valley_prominence"],
+            "base_score": peak_stats["base_score"],
+            "contrast": peak_stats["contrast"],
+            "prom_frac": peak_stats["prom_frac"],
+            "log_ratio": peak_stats["log_ratio"],
+            "left_valley_score_idx": peak_stats["left_valley_score_idx"],
+            "right_valley_score_idx": peak_stats["right_valley_score_idx"],
             "local_jump_sinuosity": None,
             "local_jump_distance": None,
             "local_jump_turning": None,
-            "passes_score_threshold": False,
+            "passes_score_threshold": not use_score_percentile_gate,
             "passes_prominence_threshold": False,
             "passes_jump_gate": None,
+            "passes_contrast_gate": None,
+            "contrast_band": None,
             "decision": "unprocessed",
             "reason": None,
         }
@@ -137,32 +220,68 @@ def detect_mode_boundaries_autoK(
     if len(peaks) == 0:
         return finish([])
 
-    score_cut = np.percentile(score, score_percentile)
-    diagnostics["score_threshold"] = float(score_cut)
-    peaks = peaks[score[peaks] >= score_cut]
-    score_kept = set(int(peak) for peak in peaks)
-    for peak, record in peak_records.items():
-        record["passes_score_threshold"] = peak in score_kept
-        if peak not in score_kept:
-            record["decision"] = "rejected"
-            record["reason"] = "below score percentile"
-    if len(peaks) == 0:
-        return finish([])
+    if use_score_percentile_gate:
+        score_cut = np.percentile(score, score_percentile)
+        diagnostics["score_threshold"] = float(score_cut)
+        peaks = peaks[score[peaks] >= score_cut]
+        score_kept = set(int(peak) for peak in peaks)
+        for peak, record in peak_records.items():
+            record["passes_score_threshold"] = peak in score_kept
+            if peak not in score_kept:
+                record["decision"] = "rejected"
+                record["reason"] = "below score percentile"
+        if len(peaks) == 0:
+            return finish([])
+    else:
+        diagnostics["score_threshold"] = None
 
-    prom = np.array([peak_prominence(score, p, left_right=left_right) for p in peaks])
-    prom_cut = np.percentile(prom, prominence_percentile)
-    diagnostics["prominence_threshold"] = float(prom_cut)
-    for peak, peak_prom in zip(peaks, prom):
-        record = peak_records[int(peak)]
-        record["prominence"] = float(peak_prom)
-        record["passes_prominence_threshold"] = bool(peak_prom >= prom_cut)
-        if peak_prom < prom_cut:
-            record["decision"] = "rejected"
-            record["reason"] = "below prominence percentile"
-    keep = prom >= prom_cut
-    peaks, prom = peaks[keep], prom[keep]
-    if len(peaks) == 0:
-        return finish([])
+    if selection_mode == "adaptive":
+        prom = np.array(
+            [
+                peak_records[int(peak)]["valley_prominence"]
+                if peak_records[int(peak)]["valley_prominence"] is not None
+                else np.nan
+                for peak in peaks
+            ],
+            float,
+        )
+        prom_cut = robust_prominence_floor(prom, mad_mult=prominence_mad_mult)
+        diagnostics["prominence_floor"] = float(prom_cut)
+        diagnostics["prominence_threshold"] = float(prom_cut)
+        borderline_floor = float(borderline_prominence_mult * prom_cut)
+        diagnostics["borderline_prominence_floor"] = borderline_floor
+
+        keep_mask = np.zeros(len(peaks), dtype=bool)
+        for i, (peak, peak_prom) in enumerate(zip(peaks, prom)):
+            record = peak_records[int(peak)]
+            record["prominence"] = None if not np.isfinite(peak_prom) else float(peak_prom)
+            record["passes_prominence_threshold"] = bool(
+                np.isfinite(peak_prom) and peak_prom >= prom_cut
+            )
+            if not np.isfinite(peak_prom) or peak_prom < prom_cut:
+                record["decision"] = "rejected"
+                record["reason"] = "below adaptive prominence floor"
+                continue
+            keep_mask[i] = True
+
+        peaks, prom = peaks[keep_mask], prom[keep_mask]
+        if len(peaks) == 0:
+            return finish([])
+    else:
+        prom = np.array([peak_prominence(score, p, left_right=left_right) for p in peaks])
+        prom_cut = np.percentile(prom, prominence_percentile)
+        diagnostics["prominence_threshold"] = float(prom_cut)
+        for peak, peak_prom in zip(peaks, prom):
+            record = peak_records[int(peak)]
+            record["prominence"] = float(peak_prom)
+            record["passes_prominence_threshold"] = bool(peak_prom >= prom_cut)
+            if peak_prom < prom_cut:
+                record["decision"] = "rejected"
+                record["reason"] = "below prominence percentile"
+        keep = prom >= prom_cut
+        peaks, prom = peaks[keep], prom[keep]
+        if len(peaks) == 0:
+            return finish([])
 
     order = np.argsort(prom)[::-1]
     peaks, prom = peaks[order], prom[order]
@@ -196,16 +315,44 @@ def detect_mode_boundaries_autoK(
         record["local_jump_distance"] = float(dist_jump)
         record["local_jump_turning"] = float(turn_jump)
 
-        if (
+        passes_jump_gate = not (
             sinu_jump < sinu_jump_min_eff
             and dist_jump < dist_jump_min_eff
             and turn_jump < turn_jump_min_eff
-        ):
-            record["passes_jump_gate"] = False
+        )
+        record["passes_jump_gate"] = bool(passes_jump_gate)
+
+        if selection_mode == "adaptive":
+            contrast = record["contrast"]
+            if contrast is None or not np.isfinite(contrast):
+                record["passes_contrast_gate"] = False
+                record["contrast_band"] = "undefined"
+                record["decision"] = "rejected"
+                record["reason"] = "undefined contrast"
+                continue
+
+            if contrast >= contrast_high:
+                record["contrast_band"] = "high"
+                passes_contrast_gate = passes_jump_gate
+                contrast_reason = "insufficient local jump"
+            elif contrast >= contrast_low:
+                record["contrast_band"] = "mid"
+                passes_contrast_gate = passes_jump_gate or peak_prom >= borderline_floor
+                contrast_reason = "borderline contrast without strong support"
+            else:
+                record["contrast_band"] = "low"
+                passes_contrast_gate = passes_jump_gate and peak_prom >= borderline_floor
+                contrast_reason = "low contrast"
+
+            record["passes_contrast_gate"] = bool(passes_contrast_gate)
+            if not passes_contrast_gate:
+                record["decision"] = "rejected"
+                record["reason"] = contrast_reason
+                continue
+        elif not passes_jump_gate:
             record["decision"] = "rejected"
             record["reason"] = "insufficient local jump"
             continue
-        record["passes_jump_gate"] = True
 
         too_close_to = next(
             (int(chosen) for chosen in chosen_k if abs(k - chosen) < min_sep),
@@ -254,6 +401,174 @@ def detect_mode_boundaries_autoK(
             record["decision"] = "rejected"
             record["reason"] = "weaker than gap-ratio stop"
     return finish(kept)
+
+
+def detect_mode_boundaries_autoK(*args, **kwargs):
+    """Backward-compatible alias for the threshold detector."""
+    return detect_boundary_thresholds_autoK(*args, **kwargs)
+
+
+def maybe_add_terminal_threshold(
+    sigmas,
+    score,
+    boundary_indices,
+    *,
+    sinuosity,
+    turning,
+    dist,
+    tail_frac: float = 0.20,
+    min_prom_frac: float = 0.35,
+    min_sep: int = 10,
+    log_sigma_tol: float = 0.08,
+    left_right: int = 12,
+    score_percentile: float = 80,
+    use_relative_jumps: bool = True,
+    sinu_jump_min: float = 0.05,
+    dist_jump_min: float = 50.0,
+    turn_jump_min: float = 0.00015,
+    sinu_jump_rel: float = 0.02,
+    dist_jump_rel: float = 0.03,
+    turn_jump_rel: float = 0.05,
+    min_sinu_drop: float = 0.03,
+    min_dist_increase: float = 0.10,
+):
+    info = {
+        "added_terminal_threshold": False,
+        "reason": None,
+        "tail_frac": float(tail_frac),
+        "min_prom_frac": float(min_prom_frac),
+        "min_sep": int(min_sep),
+        "log_sigma_tol": float(log_sigma_tol),
+        "score_percentile": float(score_percentile),
+        "min_sinu_drop": float(min_sinu_drop),
+        "min_dist_increase": float(min_dist_increase),
+    }
+
+    sigmas = np.asarray(sigmas, float)
+    score = np.asarray(score, float)
+    sinuosity = np.asarray(sinuosity, float)
+    turning = np.asarray(turning, float)
+    dist = np.asarray(dist, float)
+    boundary_indices = sorted(set(int(k) for k in boundary_indices))
+    info["boundary_indices_before"] = [int(k) for k in boundary_indices]
+
+    if len(sigmas) < 10 or len(score) < 5:
+        info["reason"] = "insufficient data"
+        return boundary_indices, info
+
+    score_cut = float(np.percentile(score, score_percentile))
+    info["score_threshold"] = score_cut
+
+    j0 = max(int((1 - tail_frac) * len(score)), 0)
+    tail = score[j0:]
+    info["tail_start_score_idx"] = int(j0)
+    info["tail_start_sigma"] = float(sigmas[min(j0 + 1, len(sigmas) - 1)])
+    if len(tail) < 5:
+        info["reason"] = "tail too short"
+        return boundary_indices, info
+
+    j_peak = j0 + int(np.argmax(tail))
+    k = j_peak + 1
+    info["tail_peak_score_idx"] = int(j_peak)
+    info["sigma_idx"] = int(k)
+    info["sigma"] = float(sigmas[k])
+    info["score"] = float(score[j_peak])
+    info["passes_score_threshold"] = bool(score[j_peak] >= score_cut)
+
+    if not info["passes_score_threshold"]:
+        info["reason"] = "tail score below percentile threshold"
+        return boundary_indices, info
+
+    prom = peak_prominence(score, j_peak, left_right=left_right)
+    prom_global = float(
+        np.max([peak_prominence(score, j, left_right=left_right) for j in range(len(score))])
+    )
+    info["prominence"] = float(prom)
+    info["prominence_global_max"] = float(prom_global)
+    info["prominence_ratio"] = float(prom / max(prom_global, 1e-12))
+    if prom_global <= 0:
+        info["reason"] = "no global prominence"
+        return boundary_indices, info
+
+    if prom < min_prom_frac * prom_global:
+        info["reason"] = f"tail peak not prominent enough ({prom:.4g})"
+        return boundary_indices, info
+
+    if any(abs(k - existing) < min_sep for existing in boundary_indices):
+        info["reason"] = "too close to existing threshold (index)"
+        return boundary_indices, info
+
+    if any(abs(np.log(sigmas[k] / sigmas[existing])) < log_sigma_tol for existing in boundary_indices):
+        info["reason"] = "too close to existing threshold (log-sigma)"
+        return boundary_indices, info
+
+    if use_relative_jumps:
+        sinu_scale = max(np.ptp(sinuosity), 1e-12)
+        dist_scale = max(np.max(dist), 1e-12)
+        turn_scale = max(np.ptp(turning), 1e-12)
+        sinu_jump_min_eff = max(sinu_jump_min, sinu_jump_rel * sinu_scale)
+        dist_jump_min_eff = max(dist_jump_min, dist_jump_rel * dist_scale)
+        turn_jump_min_eff = max(turn_jump_min, turn_jump_rel * turn_scale)
+    else:
+        sinu_jump_min_eff = sinu_jump_min
+        dist_jump_min_eff = dist_jump_min
+        turn_jump_min_eff = turn_jump_min
+    info["effective_jump_thresholds"] = {
+        "sinuosity": float(sinu_jump_min_eff),
+        "distance": float(dist_jump_min_eff),
+        "turning": float(turn_jump_min_eff),
+    }
+
+    sinu_jump = local_jump(sinuosity, k)
+    dist_jump = local_jump(dist, k)
+    turn_jump = local_jump(turning, k)
+    passes_jump_gate = not (
+        sinu_jump < sinu_jump_min_eff
+        and dist_jump < dist_jump_min_eff
+        and turn_jump < turn_jump_min_eff
+    )
+    info["local_jump_sinuosity"] = float(sinu_jump)
+    info["local_jump_distance"] = float(dist_jump)
+    info["local_jump_turning"] = float(turn_jump)
+    info["passes_jump_gate"] = bool(passes_jump_gate)
+
+    ref_k = boundary_indices[-1] if len(boundary_indices) else min(j0 + 1, len(sigmas) - 1)
+    sinu_ref = float(sinuosity[ref_k])
+    sinu_candidate = float(sinuosity[k])
+    dist_ref = float(dist[ref_k])
+    dist_candidate = float(dist[k])
+    turn_ref = float(turning[ref_k])
+    turn_candidate = float(turning[k])
+
+    sinu_drop = float(sinu_ref - sinu_candidate)
+    dist_ratio = float(dist_candidate / max(dist_ref, 1e-9))
+    turn_drop = float((turn_ref - turn_candidate) / max(turn_ref, 1e-12))
+    metric_delta_pass = (
+        sinu_drop >= float(min_sinu_drop)
+        and dist_ratio >= float(1.0 + min_dist_increase)
+    )
+    info["reference_sigma_idx"] = int(ref_k)
+    info["reference_sigma"] = float(sigmas[ref_k])
+    info["sinuosity_reference"] = sinu_ref
+    info["sinuosity_candidate"] = sinu_candidate
+    info["sinuosity_drop"] = sinu_drop
+    info["distance_reference"] = dist_ref
+    info["distance_candidate"] = dist_candidate
+    info["distance_ratio"] = dist_ratio
+    info["turning_reference"] = turn_ref
+    info["turning_candidate"] = turn_candidate
+    info["turning_drop_frac"] = turn_drop
+    info["passes_metric_delta_gate"] = bool(metric_delta_pass)
+
+    if not passes_jump_gate and not metric_delta_pass:
+        info["reason"] = "insufficient local jump and tail metric change"
+        return boundary_indices, info
+
+    out_idx = sorted(set(boundary_indices + [int(k)]))
+    info["added_terminal_threshold"] = True
+    info["reason"] = "accepted"
+    info["boundary_indices_after"] = [int(v) for v in out_idx]
+    return out_idx, info
 
 
 def representative_modes_by_stability(sigmas, reps, boundaries_idx, score):

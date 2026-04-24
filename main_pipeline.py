@@ -17,8 +17,8 @@ import numpy as np
 from shapely.geometry import LineString
 
 from supporting_boundaries import (
-    detect_mode_boundaries_autoK,
-    maybe_add_terminal_mode,
+    detect_boundary_thresholds_autoK,
+    maybe_add_terminal_threshold,
     pick_axis_sigma,
     prune_redundant_adjacent_modes,
     representative_modes_by_stability,
@@ -110,10 +110,16 @@ def extract_line_modes_auto(
     width_m=None,
     step_m=None,
     n_sigmas: int = 120,
+    peak_selection_mode: str = "adaptive",
+    use_score_percentile_gate: bool = False,
     min_sep: int = 10,
     smooth_w: int = 7,
     score_percentile: float = 80,
     prominence_percentile: float = 70,
+    prominence_mad_mult: float = 1.5,
+    contrast_low: float = 0.15,
+    contrast_high: float = 0.30,
+    borderline_prominence_mult: float = 1.25,
     left_right: int = 12,
     use_relative_jumps: bool = True,
     sinu_jump_min: float = 0.05,
@@ -131,11 +137,14 @@ def extract_line_modes_auto(
     eps_factor: float = 1.0,
     eps_power: float = 0.5,
     snap_to_original: bool = False,
+    derive_modes: bool = True,
+    prune_modes: bool = False,
     prune_dist_abs: float = 30.0,
     prune_dist_w_frac: float = 0.30,
     prune_sinu_abs: float = 0.04,
     prune_sc_drop_frac: float = 0.20,
-    allow_mid_insertion: bool = True,
+    allow_axis_fallback: bool = False,
+    allow_mid_insertion: bool = False,
     allow_terminal: bool = True,
     terminal_tail_frac: float = 0.20,
     terminal_min_prom_frac: float = 0.35,
@@ -177,15 +186,21 @@ def extract_line_modes_auto(
         else:
             dist_jump_min = float(ls_eq.length) / 200.0
 
-    idx, _, score, boundary_diagnostics = detect_mode_boundaries_autoK(
+    peak_threshold_indices, _, score, boundary_diagnostics = detect_boundary_thresholds_autoK(
         sigmas,
         sinuosity,
         turning,
         dist,
+        selection_mode=peak_selection_mode,
+        use_score_percentile_gate=use_score_percentile_gate,
         min_sep=min_sep,
         smooth_w=smooth_w,
         score_percentile=score_percentile,
         prominence_percentile=prominence_percentile,
+        prominence_mad_mult=prominence_mad_mult,
+        contrast_low=contrast_low,
+        contrast_high=contrast_high,
+        borderline_prominence_mult=borderline_prominence_mult,
         left_right=left_right,
         use_relative_jumps=use_relative_jumps,
         sinu_jump_min=sinu_jump_min,
@@ -198,61 +213,31 @@ def extract_line_modes_auto(
         gap_ratio_stop=gap_ratio_stop,
         return_diagnostics=True,
     )
+    peak_threshold_indices = sorted(set(int(k) for k in peak_threshold_indices))
+    final_threshold_indices = list(peak_threshold_indices)
+    heuristic_threshold_indices: List[int] = []
+    terminal_threshold_indices: List[int] = []
 
-    axis_fallback_used = False
-    if len(idx) == 0:
-        axis_fallback_used = True
+    axis_info = {
+        "axis_fallback_used": False,
+        "reason": "disabled" if not allow_axis_fallback else "not needed",
+    }
+    if len(final_threshold_indices) == 0 and allow_axis_fallback:
         axis_sigma = pick_axis_sigma(sigmas, sinuosity, turning, dist)
         axis_idx = int(np.argmin(np.abs(np.log(sigmas) - np.log(axis_sigma))))
-        idx = [axis_idx]
-
-    def build_and_prune(
-        idx_list: List[int],
-    ) -> Tuple[np.ndarray, List[LineString], Dict[str, Any], np.ndarray]:
-        mode_candidate_sigmas, mode_lines_smooth = representative_modes_by_stability(
-            sigmas, reps, idx_list, score
-        )
-
-        modes = []
-        for sigma, mode in zip(mode_candidate_sigmas, mode_lines_smooth):
-            out = simplify_mode(
-                mode,
-                sigma=float(sigma),
-                eps_floor=float(eps_floor),
-                eps_factor=float(eps_factor),
-                power=float(eps_power),
-            )
-            if snap_to_original:
-                out = snap_vertices_to_original(out, ls_eq)
-            modes.append(out)
-
-        modes, mode_sigmas, prune_diagnostics = prune_redundant_adjacent_modes(
-            modes,
-            mode_candidate_sigmas,
-            original=ls_eq,
-            width_m=width_m,
-            dist_abs=prune_dist_abs,
-            first_dist_w_mult=3.0,
-            adj_dist_w_mult=3.0,
-            dist_w_frac=prune_dist_w_frac,
-            turn_frac_min=0.15,
-            sc_frac_min=prune_sc_drop_frac,
-            sinu_abs_min=prune_sinu_abs,
-            dist_sample_spacing=dist_sample_spacing,
-            dist_min_samples=dist_sample_min_samples,
-            dist_max_samples=dist_sample_max_samples,
-            return_diagnostics=True,
-        )
-
-        return mode_sigmas, modes, prune_diagnostics, mode_candidate_sigmas
-
-    idx = sorted(set(idx))
-    mode_sigmas, modes, prune_diagnostics, mode_candidate_sigmas = build_and_prune(idx)
+        final_threshold_indices = [axis_idx]
+        heuristic_threshold_indices = [axis_idx]
+        axis_info = {
+            "axis_fallback_used": True,
+            "reason": "accepted",
+            "sigma_idx": int(axis_idx),
+            "sigma": float(sigmas[axis_idx]),
+        }
 
     mid_info = {"mid_added": False, "reason": "disabled"}
-    if allow_mid_insertion:
+    if allow_mid_insertion and len(final_threshold_indices) > 0:
         idx2, mid_info = try_insert_mid_boundary(
-            idx,
+            final_threshold_indices,
             sigmas=sigmas,
             reps=reps,
             score=score,
@@ -272,97 +257,220 @@ def extract_line_modes_auto(
             dist_min_samples=dist_sample_min_samples,
             dist_max_samples=dist_sample_max_samples,
         )
-        if idx2 != idx:
-            idx = idx2
-            mode_sigmas, modes, prune_diagnostics, mode_candidate_sigmas = build_and_prune(idx)
+        if idx2 != final_threshold_indices:
+            heuristic_threshold_indices.extend(
+                [int(k) for k in idx2 if int(k) not in final_threshold_indices]
+            )
+            final_threshold_indices = sorted(set(int(k) for k in idx2))
+    elif allow_mid_insertion:
+        mid_info = {"mid_added": False, "reason": "requires existing thresholds"}
 
-    terminal_info = {"added_terminal": False, "reason": "disabled"}
+    terminal_info = {
+        "added_terminal_threshold": False,
+        "reason": "disabled" if not allow_terminal else "not added",
+    }
     if allow_terminal:
-        mode_sigmas, modes, terminal_info = maybe_add_terminal_mode(
+        idx2, terminal_info = maybe_add_terminal_threshold(
             sigmas,
-            reps,
-            modes,
-            mode_sigmas,
             score,
+            final_threshold_indices,
+            sinuosity=sinuosity,
+            turning=turning,
+            dist=dist,
             tail_frac=terminal_tail_frac,
             min_prom_frac=terminal_min_prom_frac,
+            min_sep=min_sep,
+            left_right=left_right,
+            score_percentile=score_percentile,
+            use_relative_jumps=use_relative_jumps,
+            sinu_jump_min=sinu_jump_min,
+            dist_jump_min=float(dist_jump_min),
+            turn_jump_min=turn_jump_min,
+            sinu_jump_rel=sinu_jump_rel,
+            dist_jump_rel=dist_jump_rel,
+            turn_jump_rel=turn_jump_rel,
             min_sinu_drop=terminal_min_sinu_drop,
             min_dist_increase=terminal_min_dist_increase,
-            ls_eq=ls_eq,
-            dist_sample_spacing=dist_sample_spacing,
-            dist_min_samples=dist_sample_min_samples,
-            dist_max_samples=dist_sample_max_samples,
         )
+        if idx2 != final_threshold_indices:
+            terminal_threshold_indices = [
+                int(k) for k in idx2 if int(k) not in final_threshold_indices
+            ]
+            final_threshold_indices = sorted(set(int(k) for k in idx2))
+    terminal_info["added_terminal"] = bool(
+        terminal_info.get("added_terminal_threshold", False)
+    )
+
+    final_threshold_indices = sorted(set(int(k) for k in final_threshold_indices))
+    threshold_sigmas = (
+        sigmas[np.asarray(final_threshold_indices, dtype=int)]
+        if len(final_threshold_indices)
+        else np.array([])
+    )
+    score_peak_threshold_sigmas = (
+        sigmas[np.asarray(peak_threshold_indices, dtype=int)]
+        if len(peak_threshold_indices)
+        else np.array([])
+    )
+    heuristic_threshold_indices = sorted(set(int(k) for k in heuristic_threshold_indices))
+    heuristic_threshold_sigmas = (
+        sigmas[np.asarray(heuristic_threshold_indices, dtype=int)]
+        if len(heuristic_threshold_indices)
+        else np.array([])
+    )
+    terminal_threshold_sigmas = (
+        sigmas[np.asarray(terminal_threshold_indices, dtype=int)]
+        if len(terminal_threshold_indices)
+        else np.array([])
+    )
+    score_peak_candidate_indices = [
+        int(record["sigma_idx"]) for record in boundary_diagnostics.get("candidates", [])
+    ]
+    rejected_peak_candidate_indices = [
+        int(record["sigma_idx"])
+        for record in boundary_diagnostics.get("candidates", [])
+        if record.get("decision") != "kept"
+    ]
+    score_peak_candidate_sigmas = (
+        sigmas[np.asarray(score_peak_candidate_indices, dtype=int)]
+        if len(score_peak_candidate_indices)
+        else np.array([])
+    )
+    rejected_peak_candidate_sigmas = (
+        sigmas[np.asarray(sorted(set(rejected_peak_candidate_indices)), dtype=int)]
+        if len(rejected_peak_candidate_indices)
+        else np.array([])
+    )
+
+    mode_candidate_sigmas = np.array([])
+    discarded_mode_candidate_sigmas = np.array([])
+    mode_sigmas = np.array([])
+    modes: List[LineString] = []
+    prune_diagnostics: Dict[str, Any] = {
+        "enabled": False,
+        "reason": "mode pruning disabled" if derive_modes else "mode derivation disabled",
+        "candidates": [],
+        "fallback": {"used": False},
+    }
+    if derive_modes:
+        mode_candidate_sigmas, mode_lines_smooth = representative_modes_by_stability(
+            sigmas, reps, final_threshold_indices, score
+        )
+
+        modes = []
+        for sigma, mode in zip(mode_candidate_sigmas, mode_lines_smooth):
+            out = simplify_mode(
+                mode,
+                sigma=float(sigma),
+                eps_floor=float(eps_floor),
+                eps_factor=float(eps_factor),
+                power=float(eps_power),
+            )
+            if snap_to_original:
+                out = snap_vertices_to_original(out, ls_eq)
+            modes.append(out)
+
+        if prune_modes:
+            modes, mode_sigmas, prune_diagnostics = prune_redundant_adjacent_modes(
+                modes,
+                mode_candidate_sigmas,
+                original=ls_eq,
+                width_m=width_m,
+                dist_abs=prune_dist_abs,
+                first_dist_w_mult=3.0,
+                adj_dist_w_mult=3.0,
+                dist_w_frac=prune_dist_w_frac,
+                turn_frac_min=0.15,
+                sc_frac_min=prune_sc_drop_frac,
+                sinu_abs_min=prune_sinu_abs,
+                dist_sample_spacing=dist_sample_spacing,
+                dist_min_samples=dist_sample_min_samples,
+                dist_max_samples=dist_sample_max_samples,
+                return_diagnostics=True,
+            )
+            mode_sigmas = np.asarray(mode_sigmas, float)
+            discarded_mode_candidate_sigmas = np.array(
+                [
+                    sigma
+                    for sigma in np.asarray(mode_candidate_sigmas, float)
+                    if not np.any(np.isclose(mode_sigmas, sigma))
+                ],
+                dtype=float,
+            )
+        else:
+            mode_sigmas = np.asarray(mode_candidate_sigmas, float)
 
     if len(modes):
         sign_changes, lobes, labels = classify_modes_by_extrema(modes)
     else:
         sign_changes, lobes, labels = np.array([]), np.array([]), []
 
-    boundary_sigmas_final = (
-        sigmas[np.asarray(sorted(set(idx)), dtype=int)] if len(idx) else np.array([])
-    )
-    peak_boundary_indices = sorted(set(boundary_diagnostics.get("kept_indices", [])))
-    peak_boundary_sigmas = (
-        sigmas[np.asarray(peak_boundary_indices, dtype=int)]
-        if len(peak_boundary_indices)
-        else np.array([])
-    )
-    added_boundary_indices = [k for k in sorted(set(idx)) if k not in peak_boundary_indices]
-    added_boundary_sigmas = (
-        sigmas[np.asarray(added_boundary_indices, dtype=int)]
-        if len(added_boundary_indices)
-        else np.array([])
-    )
-    mode_candidate_sigmas = np.asarray(mode_candidate_sigmas, float)
-    kept_candidate_sigmas = np.array(
-        [sigma for sigma in mode_candidate_sigmas if np.any(np.isclose(mode_sigmas, sigma))],
-        dtype=float,
-    )
-    discarded_mode_candidate_sigmas = np.array(
-        [
-            sigma
-            for sigma in mode_candidate_sigmas
-            if not np.any(np.isclose(kept_candidate_sigmas, sigma))
-        ],
-        dtype=float,
-    )
-    boundary_diagnostics["final_boundary_indices"] = [int(k) for k in sorted(set(idx))]
-    boundary_diagnostics["final_boundary_sigmas"] = [
-        float(s) for s in boundary_sigmas_final
+    plot_data = {
+        "sigmas": sigmas,
+        "sinuosity": sinuosity,
+        "turning": turning,
+        "dist": dist,
+        "score": score,
+        "threshold_sigmas": threshold_sigmas,
+        "score_peak_candidate_sigmas": score_peak_candidate_sigmas,
+        "rejected_peak_candidate_sigmas": rejected_peak_candidate_sigmas,
+        "score_peak_threshold_sigmas": score_peak_threshold_sigmas,
+        "heuristic_threshold_sigmas": heuristic_threshold_sigmas,
+        "terminal_threshold_sigmas": terminal_threshold_sigmas,
+        "mode_sigmas": mode_sigmas,
+        "discarded_mode_candidate_sigmas": discarded_mode_candidate_sigmas,
+    }
+
+    boundary_diagnostics["threshold_indices"] = [int(k) for k in final_threshold_indices]
+    boundary_diagnostics["threshold_sigmas"] = [float(s) for s in threshold_sigmas]
+    boundary_diagnostics["score_peak_threshold_indices"] = [
+        int(k) for k in peak_threshold_indices
     ]
-    boundary_diagnostics["peak_boundary_indices"] = [int(k) for k in peak_boundary_indices]
-    boundary_diagnostics["peak_boundary_sigmas"] = [
-        float(s) for s in peak_boundary_sigmas
+    boundary_diagnostics["score_peak_threshold_sigmas"] = [
+        float(s) for s in score_peak_threshold_sigmas
     ]
-    boundary_diagnostics["added_boundary_indices"] = [int(k) for k in added_boundary_indices]
-    boundary_diagnostics["added_boundary_sigmas"] = [
-        float(s) for s in added_boundary_sigmas
+    boundary_diagnostics["heuristic_threshold_indices"] = [
+        int(k) for k in heuristic_threshold_indices
+    ]
+    boundary_diagnostics["heuristic_threshold_sigmas"] = [
+        float(s) for s in heuristic_threshold_sigmas
+    ]
+    boundary_diagnostics["terminal_threshold_indices"] = [
+        int(k) for k in terminal_threshold_indices
+    ]
+    boundary_diagnostics["terminal_threshold_sigmas"] = [
+        float(s) for s in terminal_threshold_sigmas
+    ]
+    boundary_diagnostics["score_peak_candidate_indices"] = [
+        int(k) for k in score_peak_candidate_indices
+    ]
+    boundary_diagnostics["score_peak_candidate_sigmas"] = [
+        float(s) for s in score_peak_candidate_sigmas
+    ]
+    boundary_diagnostics["rejected_peak_candidate_indices"] = [
+        int(k) for k in rejected_peak_candidate_indices
+    ]
+    boundary_diagnostics["rejected_peak_candidate_sigmas"] = [
+        float(s) for s in rejected_peak_candidate_sigmas
     ]
 
     if make_plots:
-        from supporting_plotting import plot_modes, plot_thresholding
+        from supporting_plotting import plot_modes_from_result, plot_thresholding_from_result
 
-        plot_thresholding(
-            sigmas,
-            sinuosity,
-            turning,
-            dist,
-            peak_boundary_sigmas,
-            added_boundary_sigmas,
-            discarded_mode_candidate_sigmas,
-            mode_sigmas,
-            score,
-        )
+        plot_thresholding_from_result(result={
+            "plot_data": plot_data,
+        })
 
-        plot_labels = []
-        for sigma, mode, label, sign_change in zip(
-            mode_sigmas, modes, labels, sign_changes
-        ):
-            plot_labels.append(
-                f"{label} | sigma~{sigma:.0f}m | sc={sign_change} | n={len(mode.coords)}"
+        if derive_modes and len(modes):
+            plot_modes_from_result(
+                {
+                    "ls_equal": ls_eq,
+                    "modes": modes,
+                    "mode_sigmas": mode_sigmas,
+                    "mode_labels": labels,
+                    "curvature_sign_changes": sign_changes,
+                }
             )
-        plot_modes(ls_eq, modes, labels=plot_labels)
 
     return {
         "ls_equal": ls_eq,
@@ -372,17 +480,29 @@ def extract_line_modes_auto(
         "sigmas": sigmas,
         "metrics": metrics,
         "score": score,
-        "boundary_indices": sorted(set(idx)),
-        "boundary_sigmas": boundary_sigmas_final,
-        "peak_boundary_indices": peak_boundary_indices,
-        "peak_boundary_sigmas": peak_boundary_sigmas,
-        "added_boundary_indices": added_boundary_indices,
-        "added_boundary_sigmas": added_boundary_sigmas,
+        "threshold_indices": final_threshold_indices,
+        "threshold_sigmas": threshold_sigmas,
+        "boundary_indices": final_threshold_indices,
+        "boundary_sigmas": threshold_sigmas,
+        "score_peak_candidate_indices": score_peak_candidate_indices,
+        "score_peak_candidate_sigmas": score_peak_candidate_sigmas,
+        "rejected_peak_candidate_indices": rejected_peak_candidate_indices,
+        "rejected_peak_candidate_sigmas": rejected_peak_candidate_sigmas,
+        "score_peak_threshold_indices": peak_threshold_indices,
+        "score_peak_threshold_sigmas": score_peak_threshold_sigmas,
+        "peak_boundary_indices": peak_threshold_indices,
+        "peak_boundary_sigmas": score_peak_threshold_sigmas,
+        "heuristic_threshold_indices": heuristic_threshold_indices,
+        "heuristic_threshold_sigmas": heuristic_threshold_sigmas,
+        "added_boundary_indices": heuristic_threshold_indices,
+        "added_boundary_sigmas": heuristic_threshold_sigmas,
+        "terminal_threshold_indices": terminal_threshold_indices,
+        "terminal_threshold_sigmas": terminal_threshold_sigmas,
         "mode_candidate_sigmas": mode_candidate_sigmas,
-        "kept_candidate_sigmas": kept_candidate_sigmas,
         "discarded_mode_candidate_sigmas": discarded_mode_candidate_sigmas,
         "boundary_diagnostics": boundary_diagnostics,
-        "axis_fallback_used": axis_fallback_used,
+        "axis_fallback_used": axis_info["axis_fallback_used"],
+        "axis_info": axis_info,
         "mid_info": mid_info,
         "terminal_info": terminal_info,
         "prune_diagnostics": prune_diagnostics,
@@ -391,6 +511,7 @@ def extract_line_modes_auto(
         "curvature_sign_changes": sign_changes,
         "curvature_lobes": lobes,
         "mode_labels": labels,
+        "plot_data": plot_data,
     }
 
 

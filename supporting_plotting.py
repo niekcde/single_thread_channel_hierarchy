@@ -15,41 +15,60 @@ def plot_thresholding(
     sinu,
     turn,
     dist,
-    peak_boundary_sigmas,
-    added_boundary_sigmas,
-    discarded_mode_candidate_sigmas,
+    rejected_peak_candidate_sigmas,
+    score_peak_threshold_sigmas,
+    heuristic_threshold_sigmas,
+    terminal_threshold_sigmas,
     mode_sigmas,
     score,
+    discarded_mode_candidate_sigmas=None,
 ):
     fig, ax = plt.subplots(1, 4, figsize=(20, 4))
-    peak_boundary_sigmas = np.asarray(peak_boundary_sigmas, float)
-    added_boundary_sigmas = np.asarray(added_boundary_sigmas, float)
-    discarded_mode_candidate_sigmas = np.asarray(discarded_mode_candidate_sigmas, float)
+    rejected_peak_candidate_sigmas = np.asarray(rejected_peak_candidate_sigmas, float)
+    score_peak_threshold_sigmas = np.asarray(score_peak_threshold_sigmas, float)
+    heuristic_threshold_sigmas = np.asarray(heuristic_threshold_sigmas, float)
+    terminal_threshold_sigmas = np.asarray(terminal_threshold_sigmas, float)
     mode_sigmas = np.asarray(mode_sigmas, float)
+    if discarded_mode_candidate_sigmas is None:
+        discarded_mode_candidate_sigmas = np.array([], float)
+    else:
+        discarded_mode_candidate_sigmas = np.asarray(discarded_mode_candidate_sigmas, float)
 
-    peak_boundary_style = dict(
+    rejected_peak_style = dict(
+        linestyle="-",
+        linewidth=0.9,
+        color="0.55",
+        alpha=0.55,
+    )
+    score_peak_style = dict(
         linestyle="--",
         linewidth=1.1,
         color="tab:blue",
         alpha=0.9,
     )
-    added_boundary_style = dict(
+    heuristic_threshold_style = dict(
         linestyle="-.",
         linewidth=1.2,
         color="tab:green",
         alpha=0.95,
     )
-    discarded_mode_style = dict(
-        linestyle="-",
-        linewidth=0.9,
-        color="0.55",
-        alpha=0.65,
+    terminal_threshold_style = dict(
+        linestyle="--",
+        linewidth=1.5,
+        color="tab:red",
+        alpha=0.95,
     )
     mode_style = dict(
         linestyle=":",
         linewidth=1.4,
         color="tab:orange",
         alpha=0.95,
+    )
+    discarded_mode_style = dict(
+        linestyle="-",
+        linewidth=1.0,
+        color="tab:purple",
+        alpha=0.65,
     )
 
     ax[0].plot(sigmas, sinu, linewidth=2)
@@ -71,14 +90,18 @@ def plot_thresholding(
     ax[2].set_ylabel("mean distance (m)")
 
     for axis in ax:
-        for sigma in peak_boundary_sigmas:
-            axis.axvline(sigma, **peak_boundary_style)
-        for sigma in added_boundary_sigmas:
-            axis.axvline(sigma, **added_boundary_style)
-        for sigma in discarded_mode_candidate_sigmas:
-            axis.axvline(sigma, **discarded_mode_style)
+        for sigma in rejected_peak_candidate_sigmas:
+            axis.axvline(sigma, **rejected_peak_style)
+        for sigma in score_peak_threshold_sigmas:
+            axis.axvline(sigma, **score_peak_style)
+        for sigma in heuristic_threshold_sigmas:
+            axis.axvline(sigma, **heuristic_threshold_style)
+        for sigma in terminal_threshold_sigmas:
+            axis.axvline(sigma, **terminal_threshold_style)
         for sigma in mode_sigmas:
             axis.axvline(sigma, **mode_style)
+        for sigma in discarded_mode_candidate_sigmas:
+            axis.axvline(sigma, **discarded_mode_style)
 
     ax[3].plot(sigmas[1:-1], score, linewidth=2)
     ax[3].set_xscale("log")
@@ -86,19 +109,75 @@ def plot_thresholding(
     ax[3].set_xlabel("sigma (m)")
     ax[3].set_ylabel("score")
 
-    fig.legend(
-        handles=[
-            Line2D([0], [0], label="score-peak boundary sigma", **peak_boundary_style),
-            Line2D([0], [0], label="added boundary sigma", **added_boundary_style),
-            Line2D([0], [0], label="discarded mode candidate sigma", **discarded_mode_style),
-            Line2D([0], [0], label="final mode sigma", **mode_style),
-        ],
-        loc="upper center",
-        ncol=4,
-        frameon=False,
-    )
-    plt.tight_layout(rect=(0, 0, 1, 0.93))
+    legend_items = []
+    if len(rejected_peak_candidate_sigmas):
+        legend_items.append(
+            Line2D([0], [0], label="rejected score-peak candidate", **rejected_peak_style)
+        )
+    if len(score_peak_threshold_sigmas):
+        legend_items.append(
+            Line2D([0], [0], label="score-peak threshold", **score_peak_style)
+        )
+    if len(heuristic_threshold_sigmas):
+        legend_items.append(
+            Line2D([0], [0], label="heuristic threshold", **heuristic_threshold_style)
+        )
+    if len(terminal_threshold_sigmas):
+        legend_items.append(
+            Line2D([0], [0], label="terminal threshold", **terminal_threshold_style)
+        )
+    if len(mode_sigmas):
+        legend_items.append(Line2D([0], [0], label="final mode sigma", **mode_style))
+    if len(discarded_mode_candidate_sigmas):
+        legend_items.append(
+            Line2D([0], [0], label="discarded mode candidate", **discarded_mode_style)
+        )
+
+    if legend_items:
+        fig.legend(
+            handles=legend_items,
+            loc="upper center",
+            ncol=min(4, len(legend_items)),
+            frameon=False,
+        )
+        plt.tight_layout(rect=(0, 0, 1, 0.93))
+    else:
+        plt.tight_layout()
     plt.show()
+
+
+def plot_thresholding_from_result(result):
+    plot_data = result.get("plot_data", result)
+    metrics = result.get("metrics", {})
+
+    def pick(key, fallback=None):
+        if key in plot_data:
+            return plot_data[key]
+        if key in result:
+            return result[key]
+        if key in metrics:
+            return metrics[key]
+        return fallback
+
+    return plot_thresholding(
+        sigmas=pick("sigmas"),
+        sinu=pick("sinuosity"),
+        turn=pick("turning"),
+        dist=pick("dist"),
+        rejected_peak_candidate_sigmas=pick("rejected_peak_candidate_sigmas", []),
+        score_peak_threshold_sigmas=pick(
+            "score_peak_threshold_sigmas",
+            result.get("peak_boundary_sigmas", []),
+        ),
+        heuristic_threshold_sigmas=pick(
+            "heuristic_threshold_sigmas",
+            result.get("added_boundary_sigmas", []),
+        ),
+        terminal_threshold_sigmas=pick("terminal_threshold_sigmas", []),
+        mode_sigmas=pick("mode_sigmas", []),
+        discarded_mode_candidate_sigmas=pick("discarded_mode_candidate_sigmas", []),
+        score=pick("score"),
+    )
 
 
 def plot_modes(
@@ -117,6 +196,31 @@ def plot_modes(
 
     plt.axis("equal")
     plt.show()
+
+
+def plot_modes_from_result(result):
+    modes = result.get("modes", [])
+    if len(modes) == 0:
+        return None
+
+    labels = []
+    mode_sigmas = result.get("mode_sigmas", [])
+    mode_labels = result.get("mode_labels", [])
+    sign_changes = result.get("curvature_sign_changes", [])
+
+    for i, mode in enumerate(modes):
+        if i < len(mode_labels):
+            label = str(mode_labels[i])
+        else:
+            label = f"mode {i + 1}"
+        if i < len(mode_sigmas):
+            label = f"{label} | sigma~{float(mode_sigmas[i]):.0f}m"
+        if i < len(sign_changes):
+            label = f"{label} | sc={int(sign_changes[i])}"
+        label = f"{label} | n={len(mode.coords)}"
+        labels.append(label)
+
+    return plot_modes(result["ls_equal"], modes, labels=labels)
 
 
 def plot_modes_plotly(
