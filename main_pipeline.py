@@ -150,6 +150,7 @@ def extract_line_modes_auto(
     terminal_min_prom_frac: float = 0.35,
     terminal_min_sinu_drop: float = 0.03,
     terminal_min_dist_increase: float = 0.10,
+    use_threshold_sigmas_as_modes: bool = False,
     make_plots: bool = True,
 ) -> Dict[str, Any]:
     if step_m is None:
@@ -342,23 +343,33 @@ def extract_line_modes_auto(
         else np.array([])
     )
 
-    mode_candidate_sigmas = np.array([])
+    stable_mode_candidate_sigmas = np.array([])
+    stable_mode_sigmas = np.array([])
+    stable_modes: List[LineString] = []
+    stable_mode_sign_changes = np.array([])
+    stable_mode_lobes = np.array([])
+    stable_mode_labels: List[str] = []
     discarded_mode_candidate_sigmas = np.array([])
+    threshold_mode_sigmas = np.array([])
+    threshold_modes: List[LineString] = []
+    threshold_mode_sign_changes = np.array([])
+    threshold_mode_lobes = np.array([])
+    threshold_mode_labels: List[str] = []
     mode_sigmas = np.array([])
     modes: List[LineString] = []
+    sign_changes = np.array([])
+    lobes = np.array([])
+    labels: List[str] = []
     prune_diagnostics: Dict[str, Any] = {
         "enabled": False,
         "reason": "mode pruning disabled" if derive_modes else "mode derivation disabled",
         "candidates": [],
         "fallback": {"used": False},
     }
-    if derive_modes:
-        mode_candidate_sigmas, mode_lines_smooth = representative_modes_by_stability(
-            sigmas, reps, final_threshold_indices, score
-        )
 
-        modes = []
-        for sigma, mode in zip(mode_candidate_sigmas, mode_lines_smooth):
+    def materialize_modes(candidate_sigmas, candidate_lines):
+        out_modes = []
+        for sigma, mode in zip(np.asarray(candidate_sigmas, float), candidate_lines):
             out = simplify_mode(
                 mode,
                 sigma=float(sigma),
@@ -368,12 +379,22 @@ def extract_line_modes_auto(
             )
             if snap_to_original:
                 out = snap_vertices_to_original(out, ls_eq)
-            modes.append(out)
+            out_modes.append(out)
+        return out_modes
+
+    if derive_modes:
+        stable_mode_candidate_sigmas, stable_mode_lines_smooth = representative_modes_by_stability(
+            sigmas, reps, final_threshold_indices, score
+        )
+        stable_mode_lines = materialize_modes(
+            stable_mode_candidate_sigmas,
+            stable_mode_lines_smooth,
+        )
 
         if prune_modes:
-            modes, mode_sigmas, prune_diagnostics = prune_redundant_adjacent_modes(
-                modes,
-                mode_candidate_sigmas,
+            stable_modes, stable_mode_sigmas, prune_diagnostics = prune_redundant_adjacent_modes(
+                stable_mode_lines,
+                stable_mode_candidate_sigmas,
                 original=ls_eq,
                 width_m=width_m,
                 dist_abs=prune_dist_abs,
@@ -388,22 +409,52 @@ def extract_line_modes_auto(
                 dist_max_samples=dist_sample_max_samples,
                 return_diagnostics=True,
             )
-            mode_sigmas = np.asarray(mode_sigmas, float)
+            stable_mode_sigmas = np.asarray(stable_mode_sigmas, float)
             discarded_mode_candidate_sigmas = np.array(
                 [
                     sigma
-                    for sigma in np.asarray(mode_candidate_sigmas, float)
-                    if not np.any(np.isclose(mode_sigmas, sigma))
+                    for sigma in np.asarray(stable_mode_candidate_sigmas, float)
+                    if not np.any(np.isclose(stable_mode_sigmas, sigma))
                 ],
                 dtype=float,
             )
         else:
-            mode_sigmas = np.asarray(mode_candidate_sigmas, float)
+            stable_modes = stable_mode_lines
+            stable_mode_sigmas = np.asarray(stable_mode_candidate_sigmas, float)
 
-    if len(modes):
-        sign_changes, lobes, labels = classify_modes_by_extrema(modes)
-    else:
-        sign_changes, lobes, labels = np.array([]), np.array([]), []
+        if len(stable_modes):
+            stable_mode_sign_changes, stable_mode_lobes, stable_mode_labels = classify_modes_by_extrema(
+                stable_modes
+            )
+
+        if len(final_threshold_indices):
+            threshold_mode_sigmas = sigmas[np.asarray(final_threshold_indices, dtype=int)]
+            threshold_mode_lines_smooth = [reps[int(k)] for k in final_threshold_indices]
+            threshold_modes = materialize_modes(
+                threshold_mode_sigmas,
+                threshold_mode_lines_smooth,
+            )
+            if len(threshold_modes):
+                (
+                    threshold_mode_sign_changes,
+                    threshold_mode_lobes,
+                    threshold_mode_labels,
+                ) = classify_modes_by_extrema(threshold_modes)
+
+        if use_threshold_sigmas_as_modes:
+            modes = threshold_modes
+            mode_sigmas = np.asarray(threshold_mode_sigmas, float)
+            sign_changes = np.asarray(threshold_mode_sign_changes)
+            lobes = np.asarray(threshold_mode_lobes)
+            labels = list(threshold_mode_labels)
+        else:
+            modes = stable_modes
+            mode_sigmas = np.asarray(stable_mode_sigmas, float)
+            sign_changes = np.asarray(stable_mode_sign_changes)
+            lobes = np.asarray(stable_mode_lobes)
+            labels = list(stable_mode_labels)
+
+    mode_sigma_source = "threshold" if use_threshold_sigmas_as_modes else "stability"
 
     plot_data = {
         "sigmas": sigmas,
@@ -417,8 +468,11 @@ def extract_line_modes_auto(
         "score_peak_threshold_sigmas": score_peak_threshold_sigmas,
         "heuristic_threshold_sigmas": heuristic_threshold_sigmas,
         "terminal_threshold_sigmas": terminal_threshold_sigmas,
+        "stable_mode_sigmas": stable_mode_sigmas,
+        "threshold_mode_sigmas": threshold_mode_sigmas,
         "mode_sigmas": mode_sigmas,
         "discarded_mode_candidate_sigmas": discarded_mode_candidate_sigmas,
+        "mode_sigma_source": mode_sigma_source,
     }
 
     boundary_diagnostics["threshold_indices"] = [int(k) for k in final_threshold_indices]
@@ -454,25 +508,7 @@ def extract_line_modes_auto(
         float(s) for s in rejected_peak_candidate_sigmas
     ]
 
-    if make_plots:
-        from supporting_plotting import plot_modes_from_result, plot_thresholding_from_result
-
-        plot_thresholding_from_result(result={
-            "plot_data": plot_data,
-        })
-
-        if derive_modes and len(modes):
-            plot_modes_from_result(
-                {
-                    "ls_equal": ls_eq,
-                    "modes": modes,
-                    "mode_sigmas": mode_sigmas,
-                    "mode_labels": labels,
-                    "curvature_sign_changes": sign_changes,
-                }
-            )
-
-    return {
+    result = {
         "ls_equal": ls_eq,
         "step_m": float(step_m),
         "width_m": None if width_m is None else float(width_m),
@@ -498,7 +534,18 @@ def extract_line_modes_auto(
         "added_boundary_sigmas": heuristic_threshold_sigmas,
         "terminal_threshold_indices": terminal_threshold_indices,
         "terminal_threshold_sigmas": terminal_threshold_sigmas,
-        "mode_candidate_sigmas": mode_candidate_sigmas,
+        "mode_candidate_sigmas": stable_mode_candidate_sigmas,
+        "stable_mode_candidate_sigmas": stable_mode_candidate_sigmas,
+        "stable_mode_sigmas": stable_mode_sigmas,
+        "stable_modes": stable_modes,
+        "stable_curvature_sign_changes": stable_mode_sign_changes,
+        "stable_curvature_lobes": stable_mode_lobes,
+        "stable_mode_labels": stable_mode_labels,
+        "threshold_mode_sigmas": threshold_mode_sigmas,
+        "threshold_modes": threshold_modes,
+        "threshold_curvature_sign_changes": threshold_mode_sign_changes,
+        "threshold_curvature_lobes": threshold_mode_lobes,
+        "threshold_mode_labels": threshold_mode_labels,
         "discarded_mode_candidate_sigmas": discarded_mode_candidate_sigmas,
         "boundary_diagnostics": boundary_diagnostics,
         "axis_fallback_used": axis_info["axis_fallback_used"],
@@ -506,6 +553,8 @@ def extract_line_modes_auto(
         "mid_info": mid_info,
         "terminal_info": terminal_info,
         "prune_diagnostics": prune_diagnostics,
+        "use_threshold_sigmas_as_modes": bool(use_threshold_sigmas_as_modes),
+        "mode_sigma_source": mode_sigma_source,
         "mode_sigmas": mode_sigmas,
         "modes": modes,
         "curvature_sign_changes": sign_changes,
@@ -513,6 +562,16 @@ def extract_line_modes_auto(
         "mode_labels": labels,
         "plot_data": plot_data,
     }
+
+    if make_plots:
+        from supporting_plotting import plot_modes_from_result, plot_thresholding_from_result
+
+        plot_thresholding_from_result(result)
+
+        if derive_modes and len(modes):
+            plot_modes_from_result(result)
+
+    return result
 
 
 def _demo() -> None:

@@ -146,7 +146,7 @@ def plot_thresholding(
     plt.show()
 
 
-def plot_thresholding_from_result(result):
+def plot_thresholding_from_result(result, use_threshold_modes: Optional[bool] = None):
     plot_data = result.get("plot_data", result)
     metrics = result.get("metrics", {})
 
@@ -158,6 +158,13 @@ def plot_thresholding_from_result(result):
         if key in metrics:
             return metrics[key]
         return fallback
+
+    if use_threshold_modes is None:
+        mode_sigmas = pick("mode_sigmas", [])
+    elif use_threshold_modes:
+        mode_sigmas = pick("threshold_mode_sigmas", pick("threshold_sigmas", []))
+    else:
+        mode_sigmas = pick("stable_mode_sigmas", pick("mode_sigmas", []))
 
     return plot_thresholding(
         sigmas=pick("sigmas"),
@@ -174,7 +181,7 @@ def plot_thresholding_from_result(result):
             result.get("added_boundary_sigmas", []),
         ),
         terminal_threshold_sigmas=pick("terminal_threshold_sigmas", []),
-        mode_sigmas=pick("mode_sigmas", []),
+        mode_sigmas=mode_sigmas,
         discarded_mode_candidate_sigmas=pick("discarded_mode_candidate_sigmas", []),
         score=pick("score"),
     )
@@ -198,15 +205,39 @@ def plot_modes(
     plt.show()
 
 
-def plot_modes_from_result(result):
-    modes = result.get("modes", [])
+def plot_modes_from_result(result, use_threshold_modes: Optional[bool] = None):
+    if use_threshold_modes is None:
+        modes = result.get("modes", [])
+        mode_sigmas = result.get("mode_sigmas", [])
+        mode_labels = result.get("mode_labels", [])
+        sign_changes = result.get("curvature_sign_changes", [])
+    elif use_threshold_modes:
+        modes = result.get("threshold_modes", result.get("modes", []))
+        mode_sigmas = result.get(
+            "threshold_mode_sigmas",
+            result.get("terminal_threshold_sigmas", result.get("mode_sigmas", [])),
+        )
+        mode_labels = result.get("threshold_mode_labels", result.get("mode_labels", []))
+        sign_changes = result.get(
+            "threshold_curvature_sign_changes",
+            result.get("curvature_sign_changes", []),
+        )
+    else:
+        modes = result.get("stable_modes", result.get("modes", []))
+        mode_sigmas = result.get(
+            "stable_mode_sigmas",
+            result.get("mode_candidate_sigmas", result.get("mode_sigmas", [])),
+        )
+        mode_labels = result.get("stable_mode_labels", result.get("mode_labels", []))
+        sign_changes = result.get(
+            "stable_curvature_sign_changes",
+            result.get("curvature_sign_changes", []),
+        )
+
     if len(modes) == 0:
         return None
 
     labels = []
-    mode_sigmas = result.get("mode_sigmas", [])
-    mode_labels = result.get("mode_labels", [])
-    sign_changes = result.get("curvature_sign_changes", [])
 
     for i, mode in enumerate(modes):
         if i < len(mode_labels):
