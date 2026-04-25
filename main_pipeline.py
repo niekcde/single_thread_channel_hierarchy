@@ -54,15 +54,28 @@ def choose_sigmas(
     step_m: float,
     width_m=None,
     n_sigmas: int = 120,
+    sigma_min: float | None = None,
+    sigma_max: float | None = None,
 ):
-    sigma_min = 2.0 * float(step_m)
+    if sigma_min is None:
+        sigma_min = 2.0 * float(step_m)
+    else:
+        sigma_min = float(sigma_min)
     length = float(ls_eq.length)
 
-    if width_m is not None:
-        width = float(width_m)
-        sigma_max = max(length / 3.0, 80.0 * width)
+    if sigma_max is None:
+        if width_m is not None:
+            width = float(width_m)
+            sigma_max = max(length / 3.0, 80.0 * width)
+        else:
+            sigma_max = max(length / 3.0, 8000.0)
     else:
-        sigma_max = max(length / 3.0, 8000.0)
+        sigma_max = float(sigma_max)
+
+    if sigma_min <= 0 or sigma_max <= 0:
+        raise ValueError("sigma_min and sigma_max must be positive")
+    if sigma_max <= sigma_min:
+        raise ValueError("sigma_max must be greater than sigma_min")
 
     return np.geomspace(sigma_min, sigma_max, int(n_sigmas))
 
@@ -110,6 +123,8 @@ def extract_line_modes_auto(
     width_m=None,
     step_m=None,
     n_sigmas: int = 120,
+    sigma_min: float | None = None,
+    sigma_max: float | None = None,
     peak_selection_mode: str = "adaptive",
     use_score_percentile_gate: bool = False,
     min_sep: int = 10,
@@ -167,7 +182,14 @@ def extract_line_modes_auto(
         min_samples=dist_sample_min_samples,
         max_samples=dist_sample_max_samples,
     )
-    sigmas = choose_sigmas(ls_eq, step_m=step_m, width_m=width_m, n_sigmas=n_sigmas)
+    sigmas = choose_sigmas(
+        ls_eq,
+        step_m=step_m,
+        width_m=width_m,
+        n_sigmas=n_sigmas,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
 
     reps, metrics = build_scale_space_smooth_only(
         ls_eq,
@@ -508,11 +530,82 @@ def extract_line_modes_auto(
         float(s) for s in rejected_peak_candidate_sigmas
     ]
 
+    near_original_mult = 3.0
+    near_original_threshold = (
+        near_original_mult * float(width_m) if width_m is not None else float(prune_dist_abs)
+    )
+    near_original_candidate_indices = []
+    near_original_threshold_indices = []
+    boundary_diagnostics["near_original_flag_settings"] = {
+        "enabled": True,
+        "comparison_basis": "original",
+        "distance_threshold": float(near_original_threshold),
+        "distance_threshold_rule": (
+            f"{near_original_mult:.1f} * width_m" if width_m is not None else "prune_dist_abs"
+        ),
+        "distance_multiplier": float(near_original_mult),
+        "width_m": None if width_m is None else float(width_m),
+        "dist_sample_spacing": None
+        if dist_sample_spacing is None
+        else float(dist_sample_spacing),
+        "dist_min_samples": int(dist_sample_min_samples),
+        "dist_max_samples": int(dist_sample_max_samples),
+    }
+    for record in boundary_diagnostics.get("candidates", []):
+        k = int(record["sigma_idx"])
+        distance_to_original, sampling = mean_distance_to_original(
+            ls_eq,
+            reps[k],
+            sample_spacing=dist_sample_spacing,
+            min_samples=dist_sample_min_samples,
+            max_samples=dist_sample_max_samples,
+            return_diagnostics=True,
+        )
+        near_original_flag = bool(distance_to_original < near_original_threshold)
+        record["distance_to_original"] = float(distance_to_original)
+        record["near_original_threshold"] = float(near_original_threshold)
+        record["near_original_ratio"] = float(
+            distance_to_original / max(near_original_threshold, 1e-12)
+        )
+        record["near_original_flag"] = near_original_flag
+        record["near_original_sampling"] = sampling
+        if width_m is not None:
+            if distance_to_original < float(width_m):
+                record["near_original_tier"] = "very_near_original"
+            elif near_original_flag:
+                record["near_original_tier"] = "near_original"
+            else:
+                record["near_original_tier"] = "distinct_from_original"
+        else:
+            record["near_original_tier"] = (
+                "near_original" if near_original_flag else "distinct_from_original"
+            )
+        if near_original_flag:
+            near_original_candidate_indices.append(k)
+            if record.get("decision") == "kept":
+                near_original_threshold_indices.append(k)
+    boundary_diagnostics["near_original_candidate_indices"] = [
+        int(k) for k in sorted(set(near_original_candidate_indices))
+    ]
+    boundary_diagnostics["near_original_candidate_sigmas"] = [
+        float(sigmas[k]) for k in sorted(set(near_original_candidate_indices))
+    ]
+    boundary_diagnostics["near_original_threshold_indices"] = [
+        int(k) for k in sorted(set(near_original_threshold_indices))
+    ]
+    boundary_diagnostics["near_original_threshold_sigmas"] = [
+        float(sigmas[k]) for k in sorted(set(near_original_threshold_indices))
+    ]
+
     result = {
         "ls_equal": ls_eq,
         "step_m": float(step_m),
         "width_m": None if width_m is None else float(width_m),
         "distance_sampling": distance_sampling,
+        "sigma_min": float(sigmas[0]),
+        "sigma_max": float(sigmas[-1]),
+        "sigma_min_requested": None if sigma_min is None else float(sigma_min),
+        "sigma_max_requested": None if sigma_max is None else float(sigma_max),
         "sigmas": sigmas,
         "metrics": metrics,
         "score": score,
@@ -524,6 +617,14 @@ def extract_line_modes_auto(
         "score_peak_candidate_sigmas": score_peak_candidate_sigmas,
         "rejected_peak_candidate_indices": rejected_peak_candidate_indices,
         "rejected_peak_candidate_sigmas": rejected_peak_candidate_sigmas,
+        "near_original_candidate_indices": boundary_diagnostics["near_original_candidate_indices"],
+        "near_original_candidate_sigmas": np.asarray(
+            boundary_diagnostics["near_original_candidate_sigmas"], float
+        ),
+        "near_original_threshold_indices": boundary_diagnostics["near_original_threshold_indices"],
+        "near_original_threshold_sigmas": np.asarray(
+            boundary_diagnostics["near_original_threshold_sigmas"], float
+        ),
         "score_peak_threshold_indices": peak_threshold_indices,
         "score_peak_threshold_sigmas": score_peak_threshold_sigmas,
         "peak_boundary_indices": peak_threshold_indices,
